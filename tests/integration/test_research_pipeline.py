@@ -4,6 +4,10 @@ import os
 
 from jarvis_ai.research_pipeline import (
     clean_research_output,
+    _is_relevant_result,
+    _normalize_url,
+    _question_keywords,
+    _source_trust_score,
     finalize_with_claude,
     needs_verified_research,
     research_text_for_speech,
@@ -31,6 +35,28 @@ def run():
         )
         cleaned = clean_research_output(malformed)
         assert cleaned == "공식 사이트: https://example.com/a"
+        redirect = (
+            "https://duckduckgo.com/l/?uddg="
+            "https%3A%2F%2Fexample.com%2Fprofile"
+        )
+        assert _normalize_url(redirect) == "https://example.com/profile"
+        assert _source_trust_score({
+            "url": "https://www.bbc.com/korean/articles/example",
+            "title": "공식 인터뷰",
+        }) >= 100
+        assert _source_trust_score({
+            "url": "https://example.tistory.com/post",
+            "title": "인물 프로필",
+        }) < 0
+        assert "손흥민" in _question_keywords("손흥민에 대해서 알려줘")
+        assert _is_relevant_result(
+            "손흥민에 대해서 알려줘",
+            {"title": "손흥민 공식 프로필", "snippet": "", "url": "https://example.com"},
+        )
+        assert not _is_relevant_result(
+            "손흥민에 대해서 알려줘",
+            {"title": "SOLID", "snippet": "software principles", "url": "https://example.com"},
+        )
     finally:
         if previous is not None:
             os.environ["GEMINI_API_KEY"] = previous
