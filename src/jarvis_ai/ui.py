@@ -243,8 +243,11 @@ class HudCanvas(QWidget):
             voice = self._mic_level_smoothed
             # 실제 발화 음량이 중심 구체의 확대·수축에 직접 반영된다.
             voice_flutter = math.sin(self._tick * 0.22) * voice * 0.035
-            self._tgt_scale = 0.95 + breath * 0.05 + voice * 0.48 + voice_flutter
-            self._tgt_halo = 70.0 + breath * 22.0 + voice * 165.0
+            self._tgt_scale = min(
+                1.80,
+                0.95 + breath * 0.05 + voice * 0.80 + voice_flutter,
+            )
+            self._tgt_halo = 70.0 + breath * 22.0 + voice * 205.0
         elif self.state in ("생각 중", "처리 중"):
             # 분석 중에는 크기 변화보다 정밀한 맥동과 궤도 회전을 강조한다.
             analysis_wave = math.sin(self._tick * 0.055) * 0.5 + 0.5
@@ -345,16 +348,24 @@ class HudCanvas(QWidget):
         rendered.sort(key=lambda d: d[0])
         p.setPen(Qt.PenStyle.NoPen)
         for _, sx, sy, sz, alpha in rendered:
-            # 완전 흰색 (상태 색 무시)
-            p.setBrush(QBrush(QColor(255, 255, 255, alpha)))
+            # 답변 중에는 점 구체 자체가 밝은 파랑으로 전환된다.
+            if self.speaking:
+                point_color = QColor(80, 190, 255, alpha)
+            else:
+                point_color = QColor(255, 255, 255, alpha)
+            p.setBrush(QBrush(point_color))
             p.drawEllipse(QPointF(sx, sy), sz, sz)
 
         # ── glow halo (구체 뒤 은은한 빛) ──
         from PyQt6.QtGui import QRadialGradient
         glow_r = sph_r * 1.35
         grad = QRadialGradient(cx, cy, glow_r)
-        grad.setColorAt(0.0, QColor(255, 255, 255, min(60, int(halo * 0.35))))
-        grad.setColorAt(0.55, QColor(200, 220, 255, min(25, int(halo * 0.14))))
+        if self.speaking:
+            grad.setColorAt(0.0, QColor(45, 165, 255, min(90, int(halo * 0.42))))
+            grad.setColorAt(0.55, QColor(20, 100, 255, min(40, int(halo * 0.20))))
+        else:
+            grad.setColorAt(0.0, QColor(255, 255, 255, min(60, int(halo * 0.35))))
+            grad.setColorAt(0.55, QColor(200, 220, 255, min(25, int(halo * 0.14))))
         grad.setColorAt(1.0, QColor(0, 0, 0, 0))
         p.setBrush(QBrush(grad))
         p.drawEllipse(QPointF(cx, cy), glow_r, glow_r)

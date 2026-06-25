@@ -55,6 +55,15 @@ def run():
 
     window._toggle_chat()
     assert not window._chat_mode_event.is_set()
+
+    window._apply_state("LISTENING")
+    window._on_mic_level(1.0)
+    for _ in range(16):
+        window.hud._step()
+    assert 1.75 <= window.hud._tgt_scale <= 1.80
+
+    window._apply_state("SPEAKING")
+    assert window.hud.speaking
     print("채팅 전체 출력 및 마이크 즉시 중지 테스트 통과")
 
 
