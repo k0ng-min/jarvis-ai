@@ -7,11 +7,14 @@
 - 한국어 음성 인식과 호출어 감지
 - 마이크 음량에 반응하는 PyQt6 홀로그램 UI
 - Claude Haiku 기반 설명, 추론, 복잡한 대화
-- 인물·사건 질문은 Claude 다중 출처 웹 조사 후 Gemini 문장 검수
+- 인물·사건 질문은 Claude 기본 웹 검색으로 여러 출처를 조사하고 자체 검수
 - Open-Meteo 실시간 날씨·대기질 조회
 - 실시간 환율, 공휴일, 지진, 웹 검색
 - 계산과 단위 변환
 - 앱 실행, 컴퓨터 설정, 파일 및 브라우저 제어
+- Gmail 실제 검색·읽기·초안·발송 및 로그인 유지 웹앱 제어
+- 유튜브 영상 검색·재생·자막 기반 내용 분석
+- PDF, DOCX, XLSX, CSV, PPTX 문서 읽기·요약·질의
 - Edge TTS 한국어 음성 답변
 
 단순한 명령은 로컬 또는 전용 도구로 빠르게 처리하고, 설명과 추론이 필요한 질문만 Claude에 전달합니다.
@@ -58,6 +61,11 @@ python -m jarvis_ai
 - `자비스 서울 미세먼지 어때`
 - `자비스 100달러는 원으로 얼마야`
 - `자비스 최근 주요 지진 알려줘`
+- `자비스 지메일 안 읽은 메일 찾아줘`
+- `자비스 지메일로 user@example.com에게 테스트 메일 보내줘`
+- `자비스 구글 지도에서 서울역 찾아줘`
+- `자비스 이 유튜브 영상 분석해줘 https://youtube.com/watch?v=...`
+- `자비스 PDF 파일 요약해줘`
 - `자비스 하늘이 파란 이유를 설명해줘`
 
 ## 테스트
@@ -88,13 +96,19 @@ memory/            로컬 장기 기억
 
 설정 형식은 [config/api_keys.example.json](config/api_keys.example.json)을 참고하세요.
 
-Gemini 검수를 사용하려면 환경변수에 키를 설정하는 방식을 권장합니다.
+### Gmail 연결
 
-```powershell
-$env:GEMINI_API_KEY="발급받은 키"
-```
+1. Google Cloud에서 Gmail API를 활성화합니다.
+2. OAuth 동의 화면을 설정합니다.
+3. OAuth 클라이언트 유형을 `데스크톱 앱`으로 생성합니다.
+4. 내려받은 JSON을 `config/google_credentials.json`으로 저장합니다.
+5. 자비스에서 Gmail 명령을 실행하고 열린 Google 로그인 화면에서 한 번 승인합니다.
 
-키가 없거나 Gemini 호출이 실패하면 Claude의 다중 출처 조사 결과를 그대로 출력합니다.
+승인 토큰은 `config/google_token.json`에, 웹앱 로그인 상태는
+`config/browser_profile/`에 로컬 저장되며 모두 Git에서 제외됩니다.
+
+Gmail 발송 성공은 Google API가 메시지 ID를 반환한 경우에만 확정합니다.
+일반 웹앱 화면 자동화는 서비스 API 영수증이 없으면 성공을 단정하지 않습니다.
 
 ## 실시간 데이터 제공처
 

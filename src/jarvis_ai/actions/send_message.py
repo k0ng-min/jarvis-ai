@@ -38,7 +38,10 @@ def _send_whatsapp(receiver: str, message: str) -> str:
         pyautogui.write(message, interval=0.03)
         time.sleep(0.2)
         pyautogui.press("enter")
-        return f"{receiver}에게 WhatsApp 메시지를 보냈습니다."
+        return (
+            f"{receiver}의 WhatsApp 대화창에서 전송 키 입력까지 수행했습니다. "
+            "앱 API 확인값이 없어 실제 도착 여부는 화면에서 확인해주세요."
+        )
     except Exception as e:
         return f"WhatsApp 오류: {e}"
 
@@ -57,7 +60,10 @@ def _send_telegram(receiver: str, message: str) -> str:
         pyautogui.write(message, interval=0.03)
         time.sleep(0.2)
         pyautogui.press("enter")
-        return f"{receiver}에게 Telegram 메시지를 보냈습니다."
+        return (
+            f"{receiver}의 Telegram 대화창에서 전송 키 입력까지 수행했습니다. "
+            "앱 API 확인값이 없어 실제 도착 여부는 화면에서 확인해주세요."
+        )
     except Exception as e:
         return f"Telegram 오류: {e}"
 
@@ -80,7 +86,10 @@ def _send_instagram(receiver: str, message: str) -> str:
         pyautogui.write(message, interval=0.04)
         time.sleep(0.2)
         pyautogui.press("enter")
-        return f"{receiver}에게 Instagram DM을 보냈습니다."
+        return (
+            f"{receiver}의 Instagram 대화창에서 전송 키 입력까지 수행했습니다. "
+            "앱 API 확인값이 없어 실제 도착 여부는 화면에서 확인해주세요."
+        )
     except Exception as e:
         return f"Instagram 오류: {e}"
 
@@ -99,7 +108,10 @@ def _send_generic(platform: str, receiver: str, message: str) -> str:
         pyautogui.write(message, interval=0.03)
         time.sleep(0.2)
         pyautogui.press("enter")
-        return f"{receiver}에게 {platform} 메시지를 보냈습니다."
+        return (
+            f"{receiver}의 {platform} 대화창에서 전송 키 입력까지 수행했습니다. "
+            "앱 API 확인값이 없어 실제 도착 여부는 화면에서 확인해주세요."
+        )
     except Exception as e:
         return f"{platform} 오류: {e}"
 

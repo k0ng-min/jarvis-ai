@@ -19,6 +19,10 @@ env/
 
 # Personal configuration and memory
 config/api_keys.json
+config/google_credentials.json
+config/google_token.json
+config/browser_profile/
+config/browser_profile_chromium/
 memory/long_term.json
 memory/conversations.json
 

@@ -71,7 +71,8 @@ def _get_transcript(video_id: str) -> str | None:
     if not _TRANSCRIPT_OK:
         return None
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
         lang_priority   = ["ko", "en", "ja", "zh"]
         transcript      = None
         try:
@@ -86,7 +87,12 @@ def _get_transcript(video_id: str) -> str | None:
         if not transcript:
             return None
         fetched = transcript.fetch()
-        return " ".join(e["text"] for e in fetched)
+        return " ".join(
+            str(getattr(entry, "text", "") or entry.get("text", ""))
+            if isinstance(entry, dict)
+            else str(getattr(entry, "text", ""))
+            for entry in fetched
+        ).strip()
     except Exception as e:
         print(f"[YouTube] 트랜스크립트 오류: {e}")
         return None
@@ -132,19 +138,28 @@ def _handle_summarize(params: dict, player, speak) -> str:
     if not _TRANSCRIPT_OK:
         return "youtube-transcript-api가 설치되지 않았습니다: pip install youtube-transcript-api"
 
-    try:
-        import tkinter as tk
-        from tkinter import simpledialog
-        root = tk._default_root
-        if root is None:
-            root = tk.Tk(); root.withdraw()
-        url = simpledialog.askstring("자비스", "유튜브 영상 URL을 입력하세요:", parent=root)
-        url = url.strip() if url else None
-    except Exception:
-        url = None
+    url = str(params.get("url") or "").strip()
+    query = str(params.get("query") or "").strip()
+    if not url and query:
+        url = _scrape_first_video_url(query) or ""
+    if not url:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+            root = tk._default_root
+            if root is None:
+                root = tk.Tk(); root.withdraw()
+            url = simpledialog.askstring(
+                "자비스",
+                "분석할 유튜브 영상 URL을 입력하세요:",
+                parent=root,
+            )
+            url = url.strip() if url else ""
+        except Exception:
+            url = ""
 
     if not url:
-        return "URL이 입력되지 않았습니다."
+        return "분석할 유튜브 URL이나 검색어가 필요합니다."
 
     video_id = _extract_video_id(url)
     if not video_id:
@@ -161,6 +176,8 @@ def _handle_summarize(params: dict, player, speak) -> str:
         speak("요약을 생성하고 있습니다.")
 
     summary = _summarize_with_claude(transcript, url)
+    if not summary or summary == "요약을 생성하지 못했습니다.":
+        return "트랜스크립트는 가져왔지만 Claude 분석 결과를 생성하지 못했습니다."
 
     if params.get("save", False):
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -218,9 +235,9 @@ def youtube_video(parameters: dict, response=None, player=None, session_memory=N
         player.write_log(f"[유튜브] 액션: {action}")
 
     try:
-        if action == "play":
+        if action in {"play", "search"}:
             return _handle_play(params, player) or "완료"
-        elif action == "summarize":
+        elif action in {"summarize", "analyze"}:
             return _handle_summarize(params, player, speak) or "완료"
         elif action == "trending":
             return _handle_trending(params, player, speak) or "완료"

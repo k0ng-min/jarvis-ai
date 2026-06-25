@@ -19,8 +19,21 @@ _OS = platform.system()
 def _call_claude(prompt: str, timeout: int = 60) -> str:
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json"],
-            capture_output=True, text=True, timeout=timeout, encoding="utf-8"
+            [
+                "claude", "-p", prompt,
+                "--output-format", "json",
+                "--model", "haiku",
+                "--effort", "low",
+                "--tools", "",
+                "--permission-mode", "dontAsk",
+                "--no-chrome",
+                "--no-session-persistence",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             data = json.loads(result.stdout.strip())
@@ -211,11 +224,20 @@ def _process_pdf(path: Path, action: str, params: dict) -> str:
 
 def _read_text_file(path: Path) -> str:
     try:
-        if path.suffix.lower() in (".docx", ".doc"):
+        if path.suffix.lower() == ".doc":
+            return (
+                "구형 .doc 형식은 직접 읽을 수 없습니다. "
+                "Word에서 .docx로 저장한 뒤 다시 시도해주세요."
+            )
+        if path.suffix.lower() == ".docx":
             _ensure("python-docx")
             from docx import Document
             doc = Document(str(path))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+            return "\n".join(parts)
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"파일 읽기 실패: {e}"
@@ -223,10 +245,14 @@ def _read_text_file(path: Path) -> str:
 
 def _process_text(path: Path, action: str, params: dict) -> str:
     content = _read_text_file(path)
-    if not content:
+    if not content or content.startswith("구형 .doc"):
+        if content:
+            return content
         return "파일 내용을 읽을 수 없습니다."
 
-    if action == "summarize":
+    if action in {"read", "extract_text"}:
+        return content[:12000]
+    elif action == "summarize":
         return _call_claude(f"다음을 한국어로 요약하세요:\n\n{content[:8000]}") or "요약 실패"
     elif action == "reformat":
         fmt = params.get("format", "markdown")
@@ -242,7 +268,12 @@ def _process_text(path: Path, action: str, params: dict) -> str:
 def _read_csv(path: Path) -> str:
     """CSV/Excel 내용을 텍스트로"""
     try:
-        if path.suffix.lower() in (".xlsx", ".xls", ".ods"):
+        if path.suffix.lower() in (".xls", ".ods"):
+            return (
+                f"{path.suffix} 형식은 직접 읽을 수 없습니다. "
+                ".xlsx 또는 .csv로 저장한 뒤 다시 시도해주세요."
+            )
+        if path.suffix.lower() == ".xlsx":
             _ensure("openpyxl")
             import openpyxl
             wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
@@ -252,6 +283,7 @@ def _read_csv(path: Path) -> str:
                 rows.append(f"[시트: {sheet}]")
                 for row in list(ws.iter_rows(values_only=True))[:100]:
                     rows.append(",".join(str(v or "") for v in row))
+            wb.close()
             return "\n".join(rows)
         else:
             return path.read_text(encoding="utf-8-sig", errors="replace")
@@ -261,10 +293,14 @@ def _read_csv(path: Path) -> str:
 
 def _process_spreadsheet(path: Path, action: str, params: dict) -> str:
     content = _read_csv(path)
-    if not content:
+    if not content or "직접 읽을 수 없습니다" in content:
+        if content:
+            return content
         return "스프레드시트를 읽을 수 없습니다."
 
-    if action == "analyze":
+    if action in {"read", "extract_text"}:
+        return content[:12000]
+    elif action == "analyze":
         return _call_claude(
             f"이 데이터를 분석하고 주요 인사이트를 한국어로 제공하세요:\n\n{content[:6000]}"
         ) or "분석 실패"
@@ -533,7 +569,12 @@ def _process_archive(path: Path, action: str, params: dict) -> str:
 
 # ─── PPTX 처리 ───────────────────────────────────────────────────────────────
 
-def _process_pptx(path: Path, action: str, params: dict) -> str:
+def _ppt_extract_text(path: Path) -> str:
+    if path.suffix.lower() == ".ppt":
+        return (
+            "구형 .ppt 형식은 직접 읽을 수 없습니다. "
+            "PowerPoint에서 .pptx로 저장한 뒤 다시 시도해주세요."
+        )
     _ensure("python-pptx")
     from pptx import Presentation
 
@@ -547,9 +588,17 @@ def _process_pptx(path: Path, action: str, params: dict) -> str:
         if slide_text:
             texts.append(f"[슬라이드 {i+1}]\n" + "\n".join(slide_text))
 
-    full_text = "\n\n".join(texts)
+    return "\n\n".join(texts)
 
-    if action == "summarize":
+
+def _process_pptx(path: Path, action: str, params: dict) -> str:
+    full_text = _ppt_extract_text(path)
+    if not full_text or full_text.startswith("구형 .ppt"):
+        return full_text or "프레젠테이션에서 텍스트를 찾을 수 없습니다."
+
+    if action in {"read", "extract_text"}:
+        return full_text[:12000]
+    elif action == "summarize":
         return _call_claude(
             f"이 프레젠테이션을 한국어로 요약하세요:\n\n{full_text[:8000]}"
         ) or "요약 실패"
@@ -574,12 +623,30 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
         질문     : (선택) 파일에 대해 묻고 싶은 질문
     """
     params = parameters or {}
-    path_str = params.get("path", "").strip()
+    path_str = str(params.get("path") or params.get("file_path") or "").strip()
     action   = params.get("action", "").strip().lower()
     question = params.get("question", params.get("질문", "")).strip()
 
     if not path_str:
-        return "처리할 파일 경로를 지정해주세요."
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk._default_root
+            if root is None:
+                root = tk.Tk()
+                root.withdraw()
+            path_str = filedialog.askopenfilename(
+                title="자비스가 읽을 파일을 선택하세요",
+                filetypes=[
+                    ("지원 파일", "*.pdf *.docx *.xlsx *.csv *.pptx *.txt *.md"),
+                    ("모든 파일", "*.*"),
+                ],
+                parent=root,
+            )
+        except Exception:
+            path_str = ""
+        if not path_str:
+            return "처리할 파일이 선택되지 않았습니다."
 
     path = Path(path_str)
     if not path.exists():
@@ -604,6 +671,8 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
                 content = _read_text_file(path)
             elif cat in ("csv", "excel"):
                 content = _read_csv(path)
+            elif cat == "pptx":
+                content = _ppt_extract_text(path)
             elif cat == "json":
                 content = path.read_text(encoding="utf-8", errors="replace")
             elif cat == "code":

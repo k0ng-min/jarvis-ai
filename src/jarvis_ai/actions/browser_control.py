@@ -5,7 +5,10 @@ import platform
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+from ..paths import CONFIG_DIR
 
 
 def _get_default_browser_id() -> str:
@@ -181,7 +184,7 @@ class _BrowserThread:
         return future.result(timeout=timeout)
 
     async def _launch_browser_if_needed(self):
-        if self._browser and self._browser.is_connected():
+        if self._context and self._browser and self._browser.is_connected():
             return
 
         prog_id = _get_default_browser_id()
@@ -197,7 +200,18 @@ class _BrowserThread:
             ]
             print("[브라우저] 🎭 Opera 감지됨 — 개인 모드 비활성화")
 
-        launch_kwargs = {"headless": False}
+        profile_dir = CONFIG_DIR / "browser_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        launch_kwargs = {
+            "headless": False,
+            "user_data_dir": str(profile_dir),
+            "viewport": None,
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        }
         if self._engine_name == "chromium":
             launch_kwargs["args"] = chromium_args
         if self._exe_path:
@@ -206,34 +220,31 @@ class _BrowserThread:
             launch_kwargs["channel"] = self._channel
 
         try:
-            self._browser = await engine.launch(**launch_kwargs)
+            self._context = await engine.launch_persistent_context(**launch_kwargs)
+            self._browser = self._context.browser
             print(
-                f"[브라우저] ✅ 실행됨 ({self._engine_name}"
+                f"[브라우저] ✅ 로그인 유지 프로필로 실행됨 ({self._engine_name}"
                 f"{' / ' + self._channel if self._channel else ''}"
                 f"{' / ' + self._exe_path if self._exe_path else ''})"
             )
         except Exception as e:
             print(f"[브라우저] ⚠️ 실행 실패 ({e}), 기본 Chromium으로 전환")
-            self._browser = await self._playwright.chromium.launch(
+            fallback_dir = CONFIG_DIR / "browser_profile_chromium"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(fallback_dir),
                 headless=False,
-                args=["--start-maximized"]
+                args=["--start-maximized"],
+                viewport=None,
             )
+            self._browser = self._context.browser
 
     async def _get_page(self):
         await self._launch_browser_if_needed()
 
-        if self._context is None:
-            self._context = await self._browser.new_context(
-                viewport=None,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            )
-
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
 
         return self._page
 
@@ -257,6 +268,32 @@ class _BrowserThread:
         }
         url = engines.get(engine.lower(), engines["google"])
         return await self._go_to(url)
+
+    async def _open_service(self, service: str, query: str = "") -> str:
+        service_name = service.lower().strip()
+        encoded = quote_plus(query.strip())
+        urls = {
+            "maps": (
+                f"https://www.google.com/maps/search/?api=1&query={encoded}"
+                if encoded else "https://maps.google.com"
+            ),
+            "gmail": "https://mail.google.com",
+            "calendar": "https://calendar.google.com",
+            "drive": "https://drive.google.com",
+            "youtube": (
+                f"https://www.youtube.com/results?search_query={encoded}"
+                if encoded else "https://youtube.com"
+            ),
+        }
+        url = urls.get(service_name)
+        if not url:
+            return f"지원하지 않는 웹 서비스입니다: {service}"
+        result = await self._go_to(url)
+        if result.startswith("열림:"):
+            page = await self._get_page()
+            title = await page.title()
+            return f"웹 서비스가 열렸습니다: {title or service_name} | {page.url}"
+        return result
 
     async def _click(self, selector=None, text=None) -> str:
         page = await self._get_page()
@@ -373,8 +410,8 @@ class _BrowserThread:
         return f"입력창을 찾을 수 없습니다: '{description}'"
 
     async def _close_browser(self) -> str:
-        if self._browser:
-            await self._browser.close()
+        if self._context:
+            await self._context.close()
             self._browser = None
             self._context = None
             self._page    = None
@@ -409,7 +446,7 @@ def browser_control(
     브라우저 컨트롤러 — 시스템 기본 브라우저를 자동 감지하여 사용합니다.
 
     parameters:
-        action      : go_to | search | click | type | scroll | fill_form |
+        action      : go_to | open_service | search | click | type | scroll | fill_form |
                       smart_click | smart_type | get_text | press | close
         url         : go_to용 URL
         query       : 검색어
@@ -431,6 +468,12 @@ def browser_control(
     try:
         if action == "go_to":
             result = _bt.run(_bt._go_to(parameters.get("url", "")))
+
+        elif action == "open_service":
+            result = _bt.run(_bt._open_service(
+                parameters.get("service", ""),
+                parameters.get("query", ""),
+            ))
 
         elif action == "search":
             result = _bt.run(_bt._search(

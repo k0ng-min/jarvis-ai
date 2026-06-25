@@ -51,6 +51,7 @@ from .actions.dev_agent          import dev_agent
 from .actions.web_search         import web_search as web_search_action
 from .actions.computer_control   import computer_control
 from .actions.game_updater       import game_updater
+from .actions.gmail              import gmail_action
 from .actions.realtime_info      import (
     exchange_rate, air_quality, public_holidays, encyclopedia,
     calculate, unit_convert, recent_earthquakes,
@@ -629,6 +630,75 @@ def _fast_route(text: str) -> tuple[str | None, dict, str | None]:
     if compact in {"너누구야", "넌누구야", "이름이뭐야"}:
         return None, {}, "저는 경민님의 인공지능 비서 자비스입니다."
 
+    # ── Gmail 실제 API ──
+    # 메일 작업은 Claude의 말로 처리하지 않고 반드시 검증 가능한 Gmail API로 보낸다.
+    if any(word in t for word in ("지메일", "gmail", "이메일", "메일")):
+        email_match = re.search(
+            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+            r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+            text,
+        )
+        if any(word in t for word in ("연결", "설정", "로그인", "권한", "접근")):
+            return "gmail", {"action": "setup"}, None
+        if any(word in t for word in ("검색", "찾아", "목록", "안 읽", "안읽")):
+            query = text
+            if "안 읽" in t or "안읽" in t:
+                query = "is:unread in:inbox"
+            return "gmail", {"action": "search", "query": query, "max_results": 5}, None
+        if any(word in t for word in ("읽어", "내용", "최근 메일", "마지막 메일")):
+            return "gmail", {"action": "read_latest", "query": "in:inbox"}, None
+        if email_match and any(word in t for word in ("보내", "발송", "전송", "초안")):
+            body = text
+            address = email_match.group(0)
+            body = body.replace(address, " ")
+            for phrase in (
+                "지메일에 들어가서", "지메일로", "gmail로", "이메일로", "메일로",
+                "에게", "으로", "아무텍스트", "아무 텍스트", "넣어서",
+                "이메일", "메일", "보내봐", "보내 줘", "보내줘", "보내",
+                "발송해줘", "전송해줘", "초안 만들어줘",
+            ):
+                body = body.replace(phrase, " ")
+            body = re.sub(r"\s+", " ", body).strip(" .")
+            if not body:
+                body = "자비스에서 보낸 테스트 메일입니다."
+            action = "draft" if "초안" in t else "send"
+            return "gmail", {
+                "action": action,
+                "to": address,
+                "subject": "자비스 메시지",
+                "body": body,
+            }, None
+        return "gmail", {"action": "setup_status"}, None
+
+    # ── 지도 / 웹앱 ──
+    if any(word in t for word in ("지도", "구글맵", "google maps", "네이버지도", "카카오맵")):
+        query = text
+        for word in (
+            "구글맵에서", "구글 지도에서", "네이버지도에서", "카카오맵에서",
+            "지도에서", "구글맵", "구글 지도", "네이버지도", "카카오맵",
+            "지도", "열어서", "열어줘", "접근해봐", "검색해줘", "찾아줘",
+        ):
+            query = query.replace(word, " ")
+        query = re.sub(r"\s+", " ", query).strip()
+        return "browser_control", {
+            "action": "open_service",
+            "service": "maps",
+            "query": query,
+        }, None
+
+    web_app_match = re.search(
+        r"(https?://\S+|(?:www\.)?[A-Za-z0-9-]+\.(?:com|net|org|io|kr)(?:/\S*)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if web_app_match and any(
+        word in t for word in ("열어", "접속", "들어가", "웹사이트", "사이트")
+    ):
+        return "browser_control", {
+            "action": "go_to",
+            "url": web_app_match.group(1),
+        }, None
+
     # ── 계산 / 단위 변환 ──
     calc_text = t
     for source, target in {
@@ -788,11 +858,44 @@ def _fast_route(text: str) -> tuple[str | None, dict, str | None]:
 
     # ── 유튜브 ── (유튜, 유튜브, 동영상 등)
     if _fuzzy_match(t, ["유튜브", "youtube", "유튜", "유튜ㅠ", "동영상"]):
+        url_match = re.search(
+            r"https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)\S+",
+            text,
+            flags=re.IGNORECASE,
+        )
         query = text
         for w in ["유튜브에서", "유튜브", "youtube", "틀어줘", "틀어", "재생해줘",
-                  "재생해", "보여줘", "보여", "검색해줘", "검색해", "동영상"]:
+                  "재생해", "보여줘", "보여", "검색해줘", "검색해", "동영상",
+                  "분석해줘", "분석해", "요약해줘", "요약해", "내용 알려줘"]:
             query = re.sub(w, "", query, flags=re.IGNORECASE).strip()
+        if any(word in t for word in ("분석", "요약", "내용", "정리")):
+            return "youtube_video", {
+                "action": "analyze",
+                "url": url_match.group(0) if url_match else "",
+                "query": "" if url_match else (query or text),
+            }, None
         return "youtube_video", {"action": "search", "query": query or text}, None
+
+    # ── 문서/파일 읽기 및 분석 ──
+    file_match = re.search(
+        r"(?P<path>(?:[A-Za-z]:\\|/)[^\n\"']+\."
+        r"(?:pdf|docx?|xlsx?|csv|pptx?|txt|md))",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if file_match or any(
+        word in t for word in (
+            "pdf", "docx", "워드 파일", "엑셀 파일", "파워포인트",
+            "pptx", "문서 파일", "파일 읽어", "파일 분석", "파일 요약",
+        )
+    ):
+        action = "extract_text" if any(
+            word in t for word in ("읽어", "텍스트 추출", "내용 보여")
+        ) else "summarize" if "요약" in t else "analyze"
+        return "file_processor", {
+            "file_path": file_match.group("path").strip() if file_match else "",
+            "action": action,
+        }, None
 
     # ── 앱 열기 ──
     open_triggers = ["열어줘", "열어", "실행해줘", "실행해", "켜줘", "켜", "시작", "열기"]
@@ -856,6 +959,34 @@ def parse_tool_call(response: str) -> tuple[str | None, dict | None, str]:
     return tool_name, params, clean
 
 
+def _requires_verified_action(text: str) -> bool:
+    """Actions with external side effects must have an actual tool result."""
+    query = text.lower()
+    action_words = (
+        "보내", "발송", "전송", "예약", "결제", "구매", "삭제",
+        "메일", "이메일", "지메일", "카톡", "텔레그램", "메시지",
+        "웹사이트에 들어가", "사이트에 들어가", "로그인", "업로드",
+    )
+    return any(word in query for word in action_words)
+
+
+def _block_unverified_success(user_text: str, model_response: str) -> str:
+    """Prevent a language-only response from pretending an action succeeded."""
+    if not _requires_verified_action(user_text):
+        return model_response
+    completion_words = (
+        "보냈", "전송했", "발송했", "완료했", "예약했", "결제했",
+        "구매했", "삭제했", "접속했", "로그인했", "업로드했",
+        "보내드리겠", "처리하고 있", "잠시 후 보내",
+    )
+    if any(word in model_response for word in completion_words):
+        return (
+            "실제 도구의 성공 결과가 없어 완료했다고 말할 수 없습니다. "
+            "연결된 Gmail 또는 브라우저 도구로 다시 실행해주세요."
+        )
+    return model_response
+
+
 # ─────────────────────────────────────────────
 # 도구 실행
 # ─────────────────────────────────────────────
@@ -909,7 +1040,11 @@ def execute_tool(
 
             case "send_message":
                 r = send_message(parameters=params, player=ui)
-                return r or "메시지를 전송했습니다."
+                return r or "메시지 도구가 성공 결과를 반환하지 않아 전송 여부를 확인할 수 없습니다."
+
+            case "gmail":
+                r = gmail_action(parameters=params, player=ui)
+                return r or "Gmail이 성공 결과를 반환하지 않아 작업 완료로 처리하지 않았습니다."
 
             case "reminder":
                 r = reminder(parameters=params, player=ui)
@@ -933,7 +1068,7 @@ def execute_tool(
 
             case "browser_control":
                 r = browser_control(parameters=params, player=ui)
-                return r or "완료되었습니다."
+                return r or "브라우저가 성공 결과를 반환하지 않아 완료로 처리하지 않았습니다."
 
             case "file_controller":
                 r = file_controller(parameters=params, player=ui)
@@ -1130,7 +1265,7 @@ class JarvisAssistant:
         if tool_result is not None:
             final = tool_result
         else:
-            final = response
+            final = _block_unverified_success(user_text, response)
 
         # 도구 태그 제거 후 발화
         clean = re.sub(r"<tool>.*?</tool>", "", final, flags=re.DOTALL)
