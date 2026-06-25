@@ -20,6 +20,7 @@ env/
 # Personal configuration and memory
 config/api_keys.json
 memory/long_term.json
+memory/conversations.json
 
 # Runtime output
 test_logs/

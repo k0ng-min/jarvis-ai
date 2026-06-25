@@ -36,13 +36,20 @@ class ConversationManager:
         except Exception as e:
             print(f"[대화 이력] 저장 오류: {e}")
 
-    def add_conversation(self, user_input: str, response: str, response_type: str = "general"):
+    def add_conversation(
+        self,
+        user_input: str,
+        response: str,
+        response_type: str = "general",
+        source: str = "voice",
+    ):
         """새로운 대화 추가"""
         conversation = {
             "timestamp": datetime.now().isoformat(),
             "user": user_input,
             "response": response,
-            "type": response_type
+            "type": response_type,
+            "source": source
         }
 
         self.conversations["history"].append(conversation)

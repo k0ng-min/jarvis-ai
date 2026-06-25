@@ -30,8 +30,9 @@ import soundfile as sf
 
 from .ui import JarvisUI
 from .memory.memory_manager import (
-    load_memory, update_memory, format_memory_for_prompt
+    extract_memory, format_memory_for_prompt, load_memory, update_memory
 )
+from .conversation_history import ConversationManager
 
 from .actions.file_processor     import file_processor
 from .actions.flight_finder      import flight_finder
@@ -284,6 +285,7 @@ def speak_text(
     """동기 방식으로 TTS 재생 + 홀로그램 텍스트 표시"""
     if not text or not text.strip():
         return
+    text_only_mode = bool(ui and ui.chat_active)
     # 여러 응답이 겹쳐 재생되거나, TTS 중 마이크가 자기 목소리를 듣지 않게 한다.
     with _tts_lock:
         _tts_active.set()
@@ -291,13 +293,14 @@ def speak_text(
             ui.set_state("SPEAKING")
             ui.write_log(f"자비스: {display_text or text}")
         try:
-            # 스레드에서 호출 시 새 이벤트 루프 생성
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(_speak_async(text))
-            finally:
-                loop.close()
+            if not text_only_mode:
+                # 스레드에서 호출 시 새 이벤트 루프 생성
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_speak_async(text))
+                finally:
+                    loop.close()
         except Exception as e:
             print(f"[TTS] ❌ {e}")
         finally:
@@ -462,7 +465,11 @@ def listen_mic_with_retry(ui=None, max_retries=2, retry_delays=[0.3, 0.5]):
 # Claude Code CLI 호출
 # ─────────────────────────────────────────────
 
-def _call_claude(user_message: str, system_prompt: str = "") -> str:
+def _call_claude(
+    user_message: str,
+    system_prompt: str = "",
+    recent_context: str = "",
+) -> str:
     """claude -p 서브프로세스로 응답 생성"""
     global _session_id
 
@@ -486,6 +493,8 @@ def _call_claude(user_message: str, system_prompt: str = "") -> str:
         )
         if mem_str:
             full_message += f"\n{mem_str}\n"
+        if recent_context:
+            full_message += f"\n{recent_context}\n"
         full_message += f"\n[사용자 메시지]: {user_message}"
     else:
         full_message = user_message
@@ -1015,8 +1024,52 @@ class JarvisAssistant:
         self.system_prompt = _load_system_prompt()
         self._history: list[dict] = []
         self._interaction_busy = threading.Event()
+        self._conversation_manager = ConversationManager()
 
-    def _process_input(self, user_text: str):
+    @staticmethod
+    def _should_store_long_term(user_text: str) -> bool:
+        markers = (
+            "기억해", "내 이름은", "나는 ", "제가 ", "좋아해", "싫어해",
+            "내 프로젝트", "내 목표", "내 계획", "학교는", "사는 곳", "생일은",
+        )
+        return any(marker in user_text for marker in markers)
+
+    def _extract_long_term_memory(self, user_text: str, response: str):
+        if not self._should_store_long_term(user_text):
+            return
+        memory_update = extract_memory(user_text, response)
+        if memory_update:
+            update_memory(memory_update)
+            print("[메모리] 음성/채팅 공통 장기 기억 업데이트", flush=True)
+
+    def _respond(
+        self,
+        user_text: str,
+        response: str,
+        response_type: str,
+        source: str,
+        spoken_text: str | None = None,
+    ):
+        if not response or not response.strip():
+            return
+        self._conversation_manager.add_conversation(
+            user_text,
+            response,
+            response_type=response_type,
+            source=source,
+        )
+        threading.Thread(
+            target=self._extract_long_term_memory,
+            args=(user_text, response),
+            daemon=True,
+        ).start()
+        speak_text(
+            spoken_text or response,
+            self.ui,
+            display_text=response if spoken_text else None,
+        )
+
+    def _process_input(self, user_text: str, source: str = "voice"):
         user_text = user_text.strip()
         if not user_text:
             return
@@ -1028,15 +1081,19 @@ class JarvisAssistant:
             self.ui.set_state("처리 중")
             researched = run_research_pipeline(user_text)
             if researched:
-                speak_text(
-                    research_text_for_speech(researched),
-                    self.ui,
-                    display_text=researched,
+                self._respond(
+                    user_text,
+                    researched,
+                    "research",
+                    source,
+                    spoken_text=research_text_for_speech(researched),
                 )
             else:
-                speak_text(
+                self._respond(
+                    user_text,
                     "웹 조사를 완료하지 못했습니다. 잠시 후 다시 시도해주세요.",
-                    self.ui,
+                    "research_error",
+                    source,
                 )
             return
 
@@ -1046,7 +1103,7 @@ class JarvisAssistant:
         print(f"[라우터] {route_name}", flush=True)
         if direct_answer:
             # 로컬 답변: 동기 처리 (즉시 응답)
-            speak_text(direct_answer, self.ui)
+            self._respond(user_text, direct_answer, "local", source)
             return
         if tool_name:
             self.ui.set_state("처리 중")
@@ -1056,13 +1113,17 @@ class JarvisAssistant:
                 speak_fn=lambda t: speak_text(t, self.ui)  # 동기 처리
             )
             if result:
-                speak_text(result, self.ui)  # 동기 처리
+                self._respond(user_text, result, tool_name, source)
             return
 
         # 호출자는 이미 작업 스레드이므로 여기서 스레드를 한 번 더 만들지 않는다.
         # 그래야 응답과 TTS가 끝날 때까지 음성 루프를 정확히 멈출 수 있다.
         self.ui.set_state("처리 중")
-        response = _call_claude(user_text, self.system_prompt)
+        response = _call_claude(
+            user_text,
+            self.system_prompt,
+            recent_context=self._conversation_manager.get_recent_context(6),
+        )
 
         # 도구 호출 파싱
         tool_result = _parse_and_dispatch(
@@ -1077,17 +1138,19 @@ class JarvisAssistant:
         clean = re.sub(r"<tool>.*?</tool>", "", final, flags=re.DOTALL)
         clean = re.sub(r"<params>.*?</params>", "", clean, flags=re.DOTALL).strip()
         if clean:
-            speak_text(clean, self.ui)
+            self._respond(user_text, clean, "claude", source)
 
-    def _process_input_guarded(self, user_text: str):
+    def _process_input_guarded(self, user_text: str, source: str = "voice"):
         """한 번에 하나의 음성 명령만 처리하고 종료 후 다시 듣는다."""
         try:
-            self._process_input(user_text)
+            self._process_input(user_text, source=source)
         except Exception as e:
             print(f"[명령 처리] 오류: {e}", flush=True)
             traceback.print_exc()
         finally:
             self._interaction_busy.clear()
+            if source == "chat":
+                self.ui.set_chat_busy(False)
             if not self.ui.muted and not _tts_active.is_set():
                 self.ui.set_state("LISTENING")
 
@@ -1097,7 +1160,9 @@ class JarvisAssistant:
             return
         self._interaction_busy.set()
         threading.Thread(
-            target=self._process_input_guarded, args=(text,), daemon=True
+            target=self._process_input_guarded,
+            args=(text, "voice"),
+            daemon=True,
         ).start()
 
     def submit_text_command(self, text: str):
@@ -1106,7 +1171,7 @@ class JarvisAssistant:
             self.ui.write_log("자비스: 이전 명령을 처리하고 있어요. 잠시 후 다시 보내주세요.")
             return
         self._interaction_busy.set()
-        self._process_input_guarded(text)
+        self._process_input_guarded(text, source="chat")
 
     def voice_loop(self):
         self.ui.wait_for_api_key()

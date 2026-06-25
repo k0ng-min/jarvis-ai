@@ -154,13 +154,13 @@ class HudCanvas(QWidget):
         # ── 상태별 색상 팔레트 ──
         # (primary_hex, glow_r, glow_g, glow_b)
         self._PALETTES = {
-            "듣는 중":   ("#ffffff", 255, 255, 255),  # 흰색 (기본)
+            "듣는 중":   ("#8fffb8", 110, 255, 165),  # 옅은 초록
             "말하는 중": ("#3399ff", 0,   100, 255),  # 파란색
-            "생각 중":   ("#9900ff", 153,  0,  255),  # 보라색 (더 눈에 띄게)
-            "처리 중":   ("#ff2244", 255,  20,  40),  # 빨간색
-            "THINKING":  ("#9900ff", 153,  0,  255),  # 보라색
+            "생각 중":   ("#ff9999", 255, 130, 130),  # 옅은 빨강
+            "처리 중":   ("#ff7777", 255, 105, 105),
+            "THINKING":  ("#ff9999", 255, 130, 130),
             "SPEAKING":  ("#3399ff", 0,   100, 255),
-            "LISTENING": ("#ffffff", 255, 255, 255),
+            "LISTENING": ("#8fffb8", 110, 255, 165),
             "음소거":    ("#cc2266", 200,  10,  80),  # 자주/분홍
             "초기화 중": ("#aaaaaa", 170, 170, 170),  # 회색
         }
@@ -270,10 +270,10 @@ class HudCanvas(QWidget):
             )
             self._tgt_halo = 70.0 + breath * 22.0 + voice * 205.0
         elif self.state in ("생각 중", "처리 중"):
-            # 분석 중에는 크기 변화보다 정밀한 맥동과 궤도 회전을 강조한다.
-            analysis_wave = math.sin(self._tick * 0.055) * 0.5 + 0.5
-            self._tgt_scale = 0.98 + analysis_wave * 0.055
-            self._tgt_halo = 105.0 + analysis_wave * 42.0
+            # 원래 크기 → 축소 → 원래 크기로 반복하며 결론 도출 상태를 표현한다.
+            analysis_wave = math.sin(self._tick * 0.045) * 0.5 + 0.5
+            self._tgt_scale = 1.0 - analysis_wave * 0.28
+            self._tgt_halo = 72.0 + (1.0 - analysis_wave) * 38.0
         else:
             self._tgt_scale = 0.96 + breath * 0.10           # 0.96~1.06
             self._tgt_halo  = 80.0 + breath * 30.0
@@ -291,7 +291,7 @@ class HudCanvas(QWidget):
         if self.speaking:
             speeds = [1.3, -0.9, 2.0]
         elif self.state in ("생각 중", "처리 중"):
-            speeds = [2.5, -1.9, 3.3]
+            speeds = [0.35, -0.25, 0.48]
         elif self.state == "듣는 중" and self._mic_level_smoothed > 0.06:
             speeds = [1.0, -0.7, 1.55]
         else:
@@ -380,6 +380,10 @@ class HudCanvas(QWidget):
             width = 0.65 + strength * 2.35
             if self.speaking:
                 point_color = QColor(80, 190, 255, alpha)
+            elif self.state in ("생각 중", "처리 중"):
+                point_color = QColor(255, 145, 145, alpha)
+            elif self.state == "듣는 중":
+                point_color = QColor(135, 255, 180, alpha)
             else:
                 point_color = QColor(255, 255, 255, alpha)
             pen = QPen(point_color, width)
@@ -394,6 +398,12 @@ class HudCanvas(QWidget):
         if self.speaking:
             grad.setColorAt(0.0, QColor(45, 165, 255, min(90, int(halo * 0.42))))
             grad.setColorAt(0.55, QColor(20, 100, 255, min(40, int(halo * 0.20))))
+        elif self.state in ("생각 중", "처리 중"):
+            grad.setColorAt(0.0, QColor(255, 105, 105, min(75, int(halo * 0.38))))
+            grad.setColorAt(0.55, QColor(145, 35, 35, min(30, int(halo * 0.18))))
+        elif self.state == "듣는 중":
+            grad.setColorAt(0.0, QColor(105, 255, 160, min(72, int(halo * 0.36))))
+            grad.setColorAt(0.55, QColor(35, 150, 90, min(28, int(halo * 0.16))))
         else:
             grad.setColorAt(0.0, QColor(255, 255, 255, min(60, int(halo * 0.35))))
             grad.setColorAt(0.55, QColor(200, 220, 255, min(25, int(halo * 0.14))))
@@ -408,27 +418,6 @@ class HudCanvas(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(pw(a)))
             p.drawEllipse(QPointF(pt[0], pt[1]), 2.0, 2.0)
-
-        # ── 생각/처리 중: 교차하는 분석 궤도 ──
-        if self.state in ("생각 중", "처리 중"):
-            orbit_color = QColor(r, g, b, 150)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.save()
-            p.translate(cx, cy)
-            for i, angle in enumerate((self._scan, self._scan2, self._rings[2])):
-                p.save()
-                p.rotate(angle + i * 60)
-                p.setPen(QPen(orbit_color, 1.2 if i < 2 else 0.8))
-                orbit_w = sph_r * (2.45 + i * 0.20)
-                orbit_h = sph_r * (0.72 + i * 0.16)
-                p.drawEllipse(QRectF(-orbit_w / 2, -orbit_h / 2, orbit_w, orbit_h))
-                marker_x = math.cos(self._tick * 0.045 + i * 2.1) * orbit_w / 2
-                marker_y = math.sin(self._tick * 0.045 + i * 2.1) * orbit_h / 2
-                p.setBrush(QBrush(QColor(230, 190, 255, 220)))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QPointF(marker_x, marker_y), 2.6, 2.6)
-                p.restore()
-            p.restore()
 
         # 텍스트 오버레이 없음 (채팅 패널로 이동)
 
@@ -734,21 +723,23 @@ class MiniChatPanel(QWidget):
         self._input.returnPressed.connect(self._send)
         inp_lay.addWidget(self._input)
 
-        send_btn = QPushButton("↑")
-        send_btn.setFixedSize(34, 34)
-        send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        send_btn.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        send_btn.setStyleSheet(f"""
+        self._send_btn = QPushButton("SEND")
+        self._send_btn.setFixedSize(58, 34)
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        self._send_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {C.PRI};
                 color: #001018;
                 border: none;
-                border-radius: 17px;
+                border-radius: 10px;
+                letter-spacing: 1px;
             }}
             QPushButton:hover {{ background: {C.WHITE}; }}
+            QPushButton:disabled {{ background: {C.BORDER}; color: {C.TEXT_DIM}; }}
         """)
-        send_btn.clicked.connect(self._send)
-        inp_lay.addWidget(send_btn)
+        self._send_btn.clicked.connect(self._send)
+        inp_lay.addWidget(self._send_btn)
         card_lay.addWidget(inp_area)
 
         root.addWidget(card)
@@ -757,6 +748,7 @@ class MiniChatPanel(QWidget):
         txt = self._input.text().strip()
         if txt:
             self._input.clear()
+            self.set_busy(True)
             self.submitted.emit(txt)
 
     def focus(self): self._input.setFocus()
@@ -794,6 +786,7 @@ class MiniChatPanel(QWidget):
             </div>
         """)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        self.set_busy(False)
 
     def set_status(self, text: str, busy: bool = False):
         self._status.setText(text)
@@ -801,13 +794,22 @@ class MiniChatPanel(QWidget):
             f"color: {C.ACC2 if busy else C.GREEN}; background: transparent;"
         )
 
+    def set_busy(self, busy: bool):
+        self._input.setEnabled(not busy)
+        self._send_btn.setEnabled(not busy)
+        if busy:
+            self.set_status("답변을 준비하는 중…", busy=True)
+        else:
+            self.set_status("채팅 중 · 마이크 일시 정지")
+            self.focus()
+
 
 # ─── 채팅 버튼 (우하단 원형) ─────────────────────────────────────────────────
 
 class ChatBubbleBtn(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(46, 46)
+        self.setFixedSize(72, 38)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._open = False
         self._refresh()
@@ -816,30 +818,23 @@ class ChatBubbleBtn(QPushButton):
         self._open = v; self._refresh()
 
     def _refresh(self):
-        if self._open:
-            self.setStyleSheet("""
-                QPushButton {
-                    background: #fff;
-                    border: none;
-                    border-radius: 23px;
-                    color: #111;
-                    font-size: 16px;
-                    font-weight: bold;
-                }
-                QPushButton:hover { background: #eee; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QPushButton {
-                    background: #ffffff;
-                    border: none;
-                    border-radius: 23px;
-                    color: #111;
-                    font-size: 18px;
-                }
-                QPushButton:hover { background: #eee; }
-            """)
-        self.setText("✕" if self._open else "💬")
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {"#073246" if self._open else C.PANEL};
+                border: 1px solid {C.PRI if self._open else C.BORDER_B};
+                border-radius: 11px;
+                color: {C.WHITE if self._open else C.PRI};
+                font-size: 9px;
+                font-weight: bold;
+                letter-spacing: 2px;
+            }}
+            QPushButton:hover {{
+                background: {C.PRI_GHO};
+                border: 1px solid {C.PRI};
+                color: {C.WHITE};
+            }}
+        """)
+        self.setText("CLOSE" if self._open else "CHAT")
 
 
 # ─── 메인 윈도우 ─────────────────────────────────────────────────────────────
@@ -850,6 +845,7 @@ class MainWindow(QMainWindow):
     _jrv_sig      = pyqtSignal(str)
     _chat_log_sig = pyqtSignal(tuple)   # ("user"|"jarvis", text)
     _mic_sig      = pyqtSignal(float)   # 마이크 레벨 (0.0~1.0)
+    _chat_busy_sig = pyqtSignal(bool)
 
     def __init__(self, face_path: str = ""):
         super().__init__()
@@ -872,7 +868,7 @@ class MainWindow(QMainWindow):
 
         # 우하단 채팅 버튼
         self._chat_btn = ChatBubbleBtn(self.hud)
-        self._chat_btn.setFixedSize(52, 52)
+        self._chat_btn.setFixedSize(72, 38)
         self._chat_btn.clicked.connect(self._toggle_chat)
 
         # 채팅 패널 (대화 내역 포함)
@@ -886,6 +882,7 @@ class MainWindow(QMainWindow):
         self._jrv_sig.connect(lambda t: self.hud.set_hud_jarvis(t))
         self._chat_log_sig.connect(self._append_chat_message)
         self._mic_sig.connect(self._on_mic_level)
+        self._chat_busy_sig.connect(self._chat_panel.set_busy)
 
         # 단축키
         QShortcut(QKeySequence("F4"),  self).activated.connect(self._toggle_mute)
@@ -907,10 +904,10 @@ class MainWindow(QMainWindow):
 
     def _reposition(self):
         W, H = self.width(), self.height()
-        bsz = 52
-        self._chat_btn.setGeometry(W - bsz - 14, H - bsz - 14, bsz, bsz)
+        bw, bh = 72, 38
+        self._chat_btn.setGeometry(W - bw - 14, H - bh - 14, bw, bh)
         pw, ph = 340, min(520, H - 100)
-        self._chat_panel.setGeometry(W - pw - 14, H - bsz - ph - 12, pw, ph)
+        self._chat_panel.setGeometry(W - pw - 14, H - bh - ph - 12, pw, ph)
         if self._overlay:
             ow, oh = 380, 280
             self._overlay.setGeometry((W - ow) // 2, (H - oh) // 2, ow, oh)
@@ -1051,3 +1048,6 @@ class JarvisUI:
     def set_mic_level(self, level: float):
         """마이크 실시간 레벨 전달 (0.0~1.0)"""
         self._win._mic_sig.emit(float(level))
+
+    def set_chat_busy(self, busy: bool):
+        self._win._chat_busy_sig.emit(bool(busy))
