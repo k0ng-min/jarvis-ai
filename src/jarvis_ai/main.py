@@ -14,6 +14,7 @@ import sys
 import io
 import math
 import os
+import queue
 import traceback
 import warnings
 from array import array
@@ -307,33 +308,53 @@ def stop_speaking() -> bool:
 
 def _monitor_tts_stop(stop_monitor: threading.Event):
     """Listen only for an explicit stop phrase while Jarvis is speaking."""
-    global MIC_INDEX
     recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = True
-    recognizer.energy_threshold = 300
-    recognizer.pause_threshold = 0.45
-    mic_kwargs = {"device_index": MIC_INDEX} if MIC_INDEX is not None else {}
+    chunks: queue.Queue[bytes] = queue.Queue()
+    sample_rate = 16000
+
+    def callback(indata, frames, time_info, status):
+        if not stop_monitor.is_set():
+            chunks.put(bytes(indata))
+
     try:
-        with sr.Microphone(**mic_kwargs) as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.2)
+        with sd.RawInputStream(
+            samplerate=sample_rate,
+            blocksize=1600,
+            channels=1,
+            dtype="int16",
+            callback=callback,
+        ):
+            window = bytearray()
+            window_started = time.monotonic()
             while _tts_active.is_set() and not stop_monitor.is_set():
                 try:
-                    audio = recognizer.listen(
-                        source,
-                        timeout=0.8,
-                        phrase_time_limit=2.5,
+                    window.extend(chunks.get(timeout=0.25))
+                except queue.Empty:
+                    continue
+                if time.monotonic() - window_started < 2.2:
+                    continue
+                audio = sr.AudioData(bytes(window), sample_rate, 2)
+                window.clear()
+                window_started = time.monotonic()
+                try:
+                    heard = recognizer.recognize_google(
+                        audio,
+                        language="ko-KR",
                     )
-                    heard = recognizer.recognize_google(audio, language="ko-KR")
                     if _is_stop_speech(heard):
                         print(f"[TTS 중단 감지] '{heard}'", flush=True)
                         stop_speaking()
                         return
-                except (sr.WaitTimeoutError, sr.UnknownValueError):
+                except sr.UnknownValueError:
                     continue
                 except sr.RequestError:
                     return
     except Exception as exc:
-        print(f"[TTS 중단 감시] 비활성화: {type(exc).__name__}", flush=True)
+        print(
+            f"[TTS 중단 감시] 비활성화: "
+            f"{type(exc).__name__}: {str(exc)[:120]}",
+            flush=True,
+        )
 
 
 def speak_text(
@@ -371,11 +392,19 @@ def speak_text(
             print(f"[TTS] ❌ {e}")
         finally:
             stop_monitor.set()
+            interrupted = _tts_stop_requested.is_set()
             _tts_active.clear()
             monitor_thread.join(timeout=1.2)
             _tts_stop_requested.clear()
             if ui and not ui.muted:
                 ui.set_state("LISTENING")
+            if interrupted and ui:
+                threading.Thread(
+                    target=speak_text,
+                    args=("무엇을 도와드릴까요?", ui),
+                    daemon=True,
+                    name="TTSStopFollowup",
+                ).start()
 
 
 # ─────────────────────────────────────────────
@@ -649,30 +678,48 @@ def _call_claude(
         return f"오류 발생: {str(e)[:200]}"
 
 
+def _sanitize_final_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"(?m)^\s*#{1,6}\s*", "", cleaned)
+    cleaned = cleaned.replace("**", "").replace("```", "")
+    cleaned = re.sub(
+        r"\[([^\]]+)\]\(\[(https?://[^\]]+)\]\(https?://[^)]+\)(?:\\)?\)",
+        r"\1: \2",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)(?:\\)?\)",
+        r"\1: \2",
+        cleaned,
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _finalize_tool_result(
     user_text: str,
     tool_name: str,
     raw_result: str,
     recent_context: str = "",
 ) -> str:
-    """Turn every tool payload into a concise, verified user-facing answer."""
+    """Turn any draft or tool payload into a verified user-facing answer."""
     raw = str(raw_result or "").strip()
     if not raw:
         return "도구가 결과를 반환하지 않아 완료 여부를 확인할 수 없습니다."
 
     prompt = f"""
-당신은 자비스의 도구 결과 최종 편집자입니다.
+당신은 자비스의 모든 답변을 마지막으로 검수하는 최종 편집자입니다.
 
 [사용자 질문]
 {user_text}
 
-[사용한 도구]
+[응답 유형 또는 사용한 도구]
 {tool_name}
 
 [현재 날짜]
 {datetime.now().strftime("%Y-%m-%d")}
 
-[도구가 실제로 반환한 원본 결과]
+[검수할 원본 답변 또는 도구 결과]
 {raw[:18000]}
 
 [최근 대화 문맥]
@@ -694,6 +741,7 @@ def _finalize_tool_result(
    대체 정보나 과거 소속 정보를 덧붙이지 마세요.
 10. 틱톡·개인 블로그·나무위키·불법 중계 사이트처럼 신뢰도가 낮은 URL은
     출처 목록에서 제외하세요. 신뢰할 출처가 없으면 출처 목록을 생략하세요.
+11. 별표 두 개, 제목 기호, 코드펜스 같은 Markdown 장식은 제거하세요.
 """.strip()
     cmd = [
         "claude", "-p", prompt,
@@ -724,18 +772,12 @@ def _finalize_tool_result(
             timeout=60,
         )
         if result.returncode != 0:
-            return raw
+            return _sanitize_final_text(raw)
         data = json.loads(result.stdout.strip())
         final = str(data.get("result") or "").strip()
         if not final:
-            return raw
-        final = re.sub(r"(?m)^\s*#{1,6}\s*", "", final)
-        final = final.replace("**", "")
-        final = re.sub(
-            r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
-            r"\1: \2",
-            final,
-        )
+            return _sanitize_final_text(raw)
+        final = _sanitize_final_text(final)
         print(
             f"[Claude 최종 정리] 완료 "
             f"({time.monotonic() - started:.1f}초, {len(final)}자)",
@@ -747,7 +789,7 @@ def _finalize_tool_result(
             f"[Claude 최종 정리] 실패 - 원본 결과 사용: {type(exc).__name__}",
             flush=True,
         )
-        return raw
+        return _sanitize_final_text(raw)
 
 
 # ─────────────────────────────────────────────
@@ -1332,6 +1374,12 @@ class JarvisAssistant:
         self._history: list[dict] = []
         self._interaction_busy = threading.Event()
         self._conversation_manager = ConversationManager()
+        removed_noise = self._conversation_manager.remove_voice_noise({"섹스"})
+        if removed_noise:
+            print(
+                f"[대화 이력] STT 오인식 {removed_noise}개 제거",
+                flush=True,
+            )
         self.ui.restore_chat_history(
             self._conversation_manager.get_recent_history(20)
         )
@@ -1371,21 +1419,37 @@ class JarvisAssistant:
     ):
         if not response or not response.strip():
             return
-        self._conversation_manager.add_conversation(
+        final_response = _finalize_tool_result(
             user_text,
+            response_type,
             response,
-            response_type=response_type,
-            source=source,
+            self._conversation_manager.get_recent_context(12),
         )
+        normalized_user = re.sub(r"\s+", "", user_text.lower())
+        should_store = not (
+            source == "voice" and normalized_user in {"섹스"}
+        )
+        if should_store:
+            self._conversation_manager.add_conversation(
+                user_text,
+                final_response,
+                response_type=response_type,
+                source=source,
+            )
         threading.Thread(
             target=self._extract_long_term_memory,
-            args=(user_text, response),
+            args=(user_text, final_response),
             daemon=True,
         ).start()
+        final_spoken = (
+            research_text_for_speech(final_response)
+            if spoken_text is not None
+            else final_response
+        )
         speak_text(
-            spoken_text or response,
+            final_spoken,
             self.ui,
-            display_text=response if spoken_text else None,
+            display_text=final_response if spoken_text is not None else None,
         )
 
     def _process_input(self, user_text: str, source: str = "voice"):
@@ -1394,6 +1458,31 @@ class JarvisAssistant:
             return
         self.ui.write_log(f"나: {user_text}")
         self.ui.set_state("생각 중")
+
+        if any(
+            marker in user_text.replace(" ", "")
+            for marker in ("이전질문", "직전질문", "아까질문")
+        ):
+            recent = self._conversation_manager.get_recent_history(30)
+            previous = ""
+            for item in reversed(recent):
+                candidate = str(item.get("user") or "").strip()
+                compact = candidate.replace(" ", "")
+                if any(
+                    marker in compact
+                    for marker in ("이전질문", "직전질문", "아까질문")
+                ):
+                    continue
+                if compact in {"섹스"}:
+                    continue
+                previous = candidate
+                break
+            if previous:
+                answer = f"바로 직전 질문은 “{previous}”였습니다."
+            else:
+                answer = "저장된 이전 질문이 없습니다."
+            self._respond(user_text, answer, "history", source)
+            return
 
         if needs_verified_research(user_text):
             print("[라우터] verified_research", flush=True)
@@ -1432,13 +1521,7 @@ class JarvisAssistant:
                 speak_fn=lambda t: speak_text(t, self.ui)  # 동기 처리
             )
             if result:
-                final = _finalize_tool_result(
-                    user_text,
-                    tool_name,
-                    result,
-                    self._conversation_manager.get_recent_context(12),
-                )
-                self._respond(user_text, final, tool_name, source)
+                self._respond(user_text, result, tool_name, source)
             return
 
         # 호출자는 이미 작업 스레드이므로 여기서 스레드를 한 번 더 만들지 않는다.
@@ -1456,20 +1539,17 @@ class JarvisAssistant:
             response, self.ui, speak_fn=lambda t: speak_text(t, self.ui)
         )
         if tool_result is not None:
-            final = _finalize_tool_result(
-                user_text,
-                called_tool or "unknown_tool",
-                tool_result,
-                self._conversation_manager.get_recent_context(12),
-            )
+            final = tool_result
+            final_type = called_tool or "unknown_tool"
         else:
             final = _block_unverified_success(user_text, response)
+            final_type = "claude"
 
         # 도구 태그 제거 후 발화
         clean = re.sub(r"<tool>.*?</tool>", "", final, flags=re.DOTALL)
         clean = re.sub(r"<params>.*?</params>", "", clean, flags=re.DOTALL).strip()
         if clean:
-            self._respond(user_text, clean, "claude", source)
+            self._respond(user_text, clean, final_type, source)
 
     def _process_input_guarded(self, user_text: str, source: str = "voice"):
         """한 번에 하나의 음성 명령만 처리하고 종료 후 다시 듣는다."""

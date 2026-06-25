@@ -126,6 +126,12 @@ def run():
         restored = manager.get_recent_history(2)
         assert restored[0]["user"] == "음성 질문"
         assert restored[1]["response"] == "채팅 답변"
+        manager.add_conversation("섹스", "오인식", source="voice")
+        assert manager.remove_voice_noise({"섹스"}) == 1
+        assert all(
+            item["user"] != "섹스"
+            for item in manager.get_recent_history(10)
+        )
     history_module.HISTORY_FILE = original_history_file
 
     print("채팅 전체 출력 및 마이크 즉시 중지 테스트 통과")

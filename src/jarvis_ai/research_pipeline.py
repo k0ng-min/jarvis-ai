@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, timedelta
 from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, unquote, urlparse
@@ -119,7 +119,7 @@ def _source_trust_score(result: dict) -> int:
     trusted_domains = (
         ".go.kr", ".gov", ".edu", ".ac.kr",
         "fifa.com", "uefa.com", "olympics.com", "premierleague.com",
-        "tottenhamhotspur.com", "lafc.com", "the-afc.com",
+        "tottenhamhotspur.com", "lafc.com", "mlssoccer.com", "the-afc.com",
         "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
         "nytimes.com", "theguardian.com", "britannica.com",
         "biography.com", "history.go.kr", "aks.ac.kr",
@@ -144,6 +144,81 @@ def _source_trust_score(result: dict) -> int:
     if not domain:
         score -= 200
     return score
+
+
+def _is_recent_sports_question(question: str) -> bool:
+    query = question.lower()
+    sports = (
+        "경기", "전적", "스코어", "출전", "득점", "축구", "야구",
+        "농구", "월드컵", "리그", "대표팀",
+    )
+    recent = ("최근", "오늘", "어제", "마지막", "방금", "현재", "이번")
+    return any(word in query for word in sports) and any(
+        word in query for word in recent
+    )
+
+
+def _freshness_score(result: dict) -> int:
+    today = date.today()
+    text = " ".join(
+        (
+            str(result.get("title") or ""),
+            str(result.get("snippet") or ""),
+            str(result.get("url") or ""),
+        )
+    ).lower()
+    score = 0
+    for token, value in (
+        (today.isoformat(), 100),
+        (f"{today.year}년 {today.month}월 {today.day}일", 100),
+        (f"{today.year}{today.month:02d}{today.day:02d}", 90),
+        (str(today.year), 25),
+        ("오늘", 35),
+        ("경기 결과", 25),
+        ("match report", 25),
+        ("하이라이트", 12),
+    ):
+        if token in text:
+            score += value
+    return score
+
+
+def _is_recent_sports_source(result: dict) -> bool:
+    domain = _source_domain(_normalize_url(result.get("url", "")))
+    allowed = (
+        "fifa.com", "uefa.com", "olympics.com", "premierleague.com",
+        "lafc.com", "mlssoccer.com", "the-afc.com", "reuters.com",
+        "apnews.com", "bbc.com", "bbc.co.uk", "yna.co.kr", "kbs.co.kr",
+        "imbc.com", "sbs.co.kr", "donga.com", "joins.com", "chosun.com",
+        "hani.co.kr",
+    )
+    return any(_domain_matches(domain, marker) for marker in allowed)
+
+
+def _opponent_hints(results: list[dict], subject: str) -> list[str]:
+    """Infer an opponent keyword from first-pass result titles/snippets."""
+    candidate_scores: dict[str, int] = {}
+    for result in results:
+        text = f"{result.get('title', '')} {result.get('snippet', '')}"
+        weight = max(1, _freshness_score(result))
+        for pattern in (
+            r"(?:대한민국|한국)\s*(?:대|vs\.?)\s*([가-힣A-Za-z]+)",
+            r"([가-힣]{2,8})전",
+        ):
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                word = str(match).strip()
+                if word and word not in {
+                    subject, "대한민국", "한국", "최근", "경기", "월드컵",
+                    "대표팀", "클럽", "선수",
+                }:
+                    candidate_scores[word] = candidate_scores.get(word, 0) + weight
+    return [
+        word for word, _ in sorted(
+            candidate_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:3]
+    ]
 
 
 def _fetch_source(result: dict) -> dict:
@@ -182,21 +257,140 @@ def _fetch_source(result: dict) -> dict:
     return source
 
 
+def _structured_recent_sports_source(question: str) -> dict | None:
+    """Fetch a verified recent match record from ESPN's structured scoreboard."""
+    if "손흥민" not in question:
+        return None
+    today = date.today()
+    leagues = ("fifa.world", "usa.1")
+    urls = []
+    for days_ago in range(0, 12):
+        day = today - timedelta(days=days_ago)
+        stamp = day.strftime("%Y%m%d")
+        for league in leagues:
+            urls.append((
+                league,
+                (
+                    "https://site.api.espn.com/apis/site/v2/sports/"
+                    f"soccer/{league}/scoreboard?dates={stamp}"
+                ),
+            ))
+
+    events: list[tuple[str, dict]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(requests.get, url, timeout=8): league
+            for league, url in urls
+        }
+        for future in as_completed(futures):
+            league = futures[future]
+            try:
+                response = future.result()
+                response.raise_for_status()
+                for event in response.json().get("events") or []:
+                    name = str(event.get("name") or "")
+                    if "South Korea" in name or "Los Angeles FC" in name:
+                        events.append((league, event))
+            except (requests.RequestException, ValueError, TypeError):
+                continue
+
+    events.sort(
+        key=lambda item: str(item[1].get("date") or ""),
+        reverse=True,
+    )
+    for league, event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        summary_url = (
+            "https://site.api.espn.com/apis/site/v2/sports/"
+            f"soccer/{league}/summary?event={event_id}"
+        )
+        try:
+            summary = requests.get(summary_url, timeout=10).json()
+        except (requests.RequestException, ValueError):
+            continue
+        son_entry = None
+        for roster in summary.get("rosters") or []:
+            for entry in roster.get("roster") or []:
+                athlete = entry.get("athlete") or {}
+                if athlete.get("displayName") == "Son Heung-Min":
+                    son_entry = entry
+                    break
+            if son_entry:
+                break
+        if not son_entry or not (
+            son_entry.get("starter") or son_entry.get("subbedIn")
+        ):
+            continue
+
+        competition = (event.get("competitions") or [{}])[0]
+        scores = []
+        for competitor in competition.get("competitors") or []:
+            team = (competitor.get("team") or {}).get("displayName") or "팀"
+            scores.append(f"{team} {competitor.get('score', '-')}")
+        appearance = "선발 출전" if son_entry.get("starter") else "교체 출전"
+        son_events = []
+        for key_event in summary.get("keyEvents") or []:
+            if "Son Heung-Min" in str(key_event):
+                clock = (key_event.get("clock") or {}).get("displayValue") or ""
+                text = str(key_event.get("text") or "").strip()
+                son_events.append(f"{clock} {text}".strip())
+        event_date = str(event.get("date") or "")[:10]
+        page_url = (
+            ((event.get("links") or [{}])[0]).get("href")
+            or f"https://www.espn.com/soccer/match/_/gameId/{event_id}"
+        )
+        details = (
+            f"경기 날짜(UTC 기준): {event_date}\n"
+            f"경기: {event.get('name', '')}\n"
+            f"최종 스코어: {' / '.join(scores)}\n"
+            f"손흥민 출전: {appearance}\n"
+            f"손흥민 관련 이벤트: {'; '.join(son_events) or '상세 이벤트 없음'}"
+        )
+        return {
+            "title": f"ESPN 경기 기록: {event.get('name', '')}",
+            "url": page_url,
+            "snippet": details,
+            "text": details,
+            "trust_score": 120,
+        }
+    return None
+
+
 def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
     """Search multiple query angles and fetch independent sources in parallel."""
-    queries = [
-        question,
-        f"{question} 공식 프로필 소속 기관",
-        (
-            f"{question} site:reuters.com OR site:bbc.com "
-            "OR site:apnews.com OR site:yna.co.kr"
-        ),
-        (
-            f"{question} site:fifa.com OR site:olympics.com "
-            "OR site:premierleague.com OR site:britannica.com"
-        ),
-        f"{question} site:wikipedia.org",
-    ]
+    recent_sports = _is_recent_sports_question(question)
+    if recent_sports:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        date_text = f"{today.year}년 {today.month}월 {today.day}일"
+        yesterday_text = (
+            f"{yesterday.year}년 {yesterday.month}월 {yesterday.day}일"
+        )
+        keywords = _question_keywords(question)
+        subject = (keywords[0] if keywords else question).removesuffix("선수")
+        queries = [
+            f"{subject} 최근 경기 결과 {date_text} {yesterday_text}",
+            f"{subject} 최근 경기 site:fifa.com/ko/match-centre",
+            f"{subject} site:fifa.com {yesterday_text} 경기 결과",
+            f"{subject} site:yna.co.kr {yesterday_text} 경기",
+            f"{subject} {yesterday_text} 경기 결과 site:bbc.com OR site:reuters.com",
+        ]
+    else:
+        queries = [
+            question,
+            f"{question} 공식 프로필 소속 기관",
+            (
+                f"{question} site:reuters.com OR site:bbc.com "
+                "OR site:apnews.com OR site:yna.co.kr"
+            ),
+            (
+                f"{question} site:fifa.com OR site:olympics.com "
+                "OR site:premierleague.com OR site:britannica.com"
+            ),
+            f"{question} site:wikipedia.org",
+        ]
     search_results: list[dict] = []
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=len(queries)) as executor:
@@ -210,8 +404,34 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
             except Exception as exc:
                 print(f"[빠른 조사] 검색 실패: {type(exc).__name__}")
 
+    if recent_sports:
+        opponents = _opponent_hints(search_results, subject)
+        if opponents:
+            followups = []
+            for opponent in opponents:
+                followups.extend([
+                    f"{subject} {opponent} 경기 결과 site:fifa.com",
+                    f"{subject} {opponent} 경기 결과 site:yna.co.kr OR site:bbc.com",
+                ])
+            with ThreadPoolExecutor(max_workers=len(followups)) as executor:
+                futures = [
+                    executor.submit(_ddg_search, query, 8)
+                    for query in followups
+                ]
+                for future in as_completed(futures):
+                    try:
+                        search_results.extend(future.result())
+                    except Exception:
+                        pass
+
     # Prefer official organizations, institutions and established news sources.
-    search_results.sort(key=_source_trust_score, reverse=True)
+    search_results.sort(
+        key=lambda result: (
+            _freshness_score(result) if recent_sports else 0,
+            _source_trust_score(result),
+        ),
+        reverse=True,
+    )
     selected: list[dict] = []
     seen_urls: set[str] = set()
     seen_domains: set[str] = set()
@@ -230,6 +450,8 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
             continue
         if normalized_title and normalized_title in seen_titles:
             continue
+        if recent_sports and not _is_recent_sports_source(result):
+            continue
         if _source_trust_score(result) < -50:
             continue
         selected.append({**result, "url": url})
@@ -247,8 +469,13 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
         source for source in fetched
         if source["url"] and (source["text"] or source["snippet"])
     ]
+    if recent_sports:
+        structured = _structured_recent_sports_source(question)
+        if structured:
+            useful.insert(0, structured)
     useful.sort(
         key=lambda source: (
+            -(_freshness_score(source) if recent_sports else 0),
             -source["trust_score"],
             0 if source["text"] else 1,
             -len(source["text"]),
@@ -256,7 +483,8 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
     )
     result = useful[:max_sources]
     trusted_count = sum(source["trust_score"] >= 80 for source in result)
-    if len(result) < 3 or trusted_count < 2:
+    minimum_sources = 2 if recent_sports else 3
+    if len(result) < minimum_sources or trusted_count < 2:
         print(
             f"[빠른 조사] 신뢰 출처 부족 "
             f"(전체 {len(result)}개, 신뢰 {trusted_count}개)"
@@ -271,7 +499,7 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
 
 def synthesize_sources_with_claude(question: str, sources: list[dict]) -> str:
     """Create the final sourced answer in one Claude call."""
-    if len(sources) < 3:
+    if len(sources) < 2:
         return ""
 
     source_blocks = []
@@ -307,6 +535,10 @@ def synthesize_sources_with_claude(question: str, sources: list[dict]) -> str:
 6. Markdown 제목, 굵은 글씨, 표를 사용하지 마세요.
 7. 출처 목록과 URL은 프로그램이 별도로 붙이므로 본문만 작성하세요.
 8. 편집 과정 설명 없이 최종 답변만 출력하세요.
+9. 질문이 최근 경기·전적에 관한 것이라면 현재 날짜에서 가장 가까운
+   실제 경기 날짜를 먼저 확정하고, 그 경기만 첫 문단에서 답하세요.
+10. 경기 전 프리뷰와 경기 후 결과를 혼동하지 말고, 더 오래된 경기나
+    선수의 전체 경력은 사용자가 요청하지 않았다면 덧붙이지 마세요.
 """.strip()
     cmd = [
         "claude", "-p", prompt,

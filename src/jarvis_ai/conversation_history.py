@@ -94,6 +94,33 @@ class ConversationManager:
             for item in recent
         ]
 
+    def remove_voice_noise(self, phrases: set[str]) -> int:
+        """Remove known STT-only false recognitions and rebuild statistics."""
+        normalized = {
+            "".join(str(phrase).lower().split()) for phrase in phrases if phrase
+        }
+        history = self.conversations.get("history", [])
+        kept = []
+        removed = 0
+        for item in history:
+            user = "".join(str(item.get("user") or "").lower().split())
+            if item.get("source") == "voice" and user in normalized:
+                removed += 1
+                continue
+            kept.append(item)
+        if not removed:
+            return 0
+        by_type: dict[str, int] = {}
+        for item in kept:
+            response_type = str(item.get("type") or "general")
+            by_type[response_type] = by_type.get(response_type, 0) + 1
+        self.conversations = {
+            "history": kept,
+            "stats": {"total": len(kept), "by_type": by_type},
+        }
+        self._save_conversations()
+        return removed
+
     def get_stats(self) -> dict:
         """대화 통계"""
         return self.conversations["stats"]

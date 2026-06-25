@@ -144,7 +144,8 @@ def _call_claude_for_memory(prompt: str, system: str, max_tokens: int = 10) -> s
             capture_output=True,
             text=True,
             timeout=30,
-            encoding="utf-8"
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             return ""

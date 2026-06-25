@@ -7,6 +7,7 @@ from jarvis_ai.research_pipeline import (
     _normalize_url,
     _question_keywords,
     _source_trust_score,
+    _is_recent_sports_question,
     _split_research_answer,
     finalize_with_claude,
     needs_verified_research,
@@ -20,6 +21,8 @@ def run():
     assert needs_verified_research("OpenAI에 대해 여러 출처로 알려줘")
     assert not needs_verified_research("서울 날씨 알려줘")
     assert not needs_verified_research("100달러 환율 알려줘")
+    assert _is_recent_sports_question("손흥민 최근 경기 전적 알려줘")
+    assert not _is_recent_sports_question("손흥민의 생애를 알려줘")
 
     draft = "초안입니다.\n\n[출처]\n- 공식 사이트: https://example.com"
     spoken = research_text_for_speech(draft)
