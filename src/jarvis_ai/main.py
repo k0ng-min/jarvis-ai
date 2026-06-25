@@ -55,6 +55,11 @@ from .actions.realtime_info      import (
     calculate, unit_convert, recent_earthquakes,
 )
 from .paths import PACKAGE_DIR, PROMPT_PATH
+from .research_pipeline import (
+    needs_verified_research,
+    research_text_for_speech,
+    run_research_pipeline,
+)
 
 
 BASE_DIR = PACKAGE_DIR
@@ -271,7 +276,11 @@ async def _speak_async(text: str):
             print(f"[TTS] ❌ 오류: {e}")
 
 
-def speak_text(text: str, ui: JarvisUI | None = None):
+def speak_text(
+    text: str,
+    ui: JarvisUI | None = None,
+    display_text: str | None = None,
+):
     """동기 방식으로 TTS 재생 + 홀로그램 텍스트 표시"""
     if not text or not text.strip():
         return
@@ -280,7 +289,7 @@ def speak_text(text: str, ui: JarvisUI | None = None):
         _tts_active.set()
         if ui:
             ui.set_state("SPEAKING")
-            ui.write_log(f"자비스: {text}")
+            ui.write_log(f"자비스: {display_text or text}")
         try:
             # 스레드에서 호출 시 새 이벤트 루프 생성
             loop = asyncio.new_event_loop()
@@ -992,6 +1001,23 @@ class JarvisAssistant:
             return
         self.ui.write_log(f"나: {user_text}")
         self.ui.set_state("생각 중")
+
+        if needs_verified_research(user_text):
+            print("[라우터] verified_research", flush=True)
+            self.ui.set_state("처리 중")
+            researched = run_research_pipeline(user_text)
+            if researched:
+                speak_text(
+                    research_text_for_speech(researched),
+                    self.ui,
+                    display_text=researched,
+                )
+            else:
+                speak_text(
+                    "웹 조사를 완료하지 못했습니다. 잠시 후 다시 시도해주세요.",
+                    self.ui,
+                )
+            return
 
         # 빠른 로컬 처리 (_fast_route는 (tool_name, params, direct_answer) 튜플 반환)
         tool_name, params, direct_answer = _fast_route(user_text)

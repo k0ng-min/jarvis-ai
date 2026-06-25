@@ -7,6 +7,7 @@
 - 한국어 음성 인식과 호출어 감지
 - 마이크 음량에 반응하는 PyQt6 홀로그램 UI
 - Claude Haiku 기반 설명, 추론, 복잡한 대화
+- 인물·사건 질문은 Claude 다중 출처 웹 조사 후 Gemini 문장 검수
 - Open-Meteo 실시간 날씨·대기질 조회
 - 실시간 환율, 공휴일, 지진, 웹 검색
 - 계산과 단위 변환
@@ -86,6 +87,14 @@ memory/            로컬 장기 기억
 최초 실행 시 `config/api_keys.json`과 `memory/long_term.json`이 로컬에 생성됩니다. 이 파일들은 개인 설정과 기억을 포함할 수 있어 Git에서 제외됩니다.
 
 설정 형식은 [config/api_keys.example.json](config/api_keys.example.json)을 참고하세요.
+
+Gemini 검수를 사용하려면 환경변수에 키를 설정하는 방식을 권장합니다.
+
+```powershell
+$env:GEMINI_API_KEY="발급받은 키"
+```
+
+키가 없거나 Gemini 호출이 실패하면 Claude의 다중 출처 조사 결과를 그대로 출력합니다.
 
 ## 실시간 데이터 제공처
 
