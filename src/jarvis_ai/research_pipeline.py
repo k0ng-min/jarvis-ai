@@ -1,4 +1,4 @@
-"""Multi-source research with Claude and optional Gemini editorial review."""
+"""Multi-source web research with two-stage Claude synthesis and review."""
 
 from __future__ import annotations
 
@@ -17,12 +17,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
 from .actions.web_search import _ddg_search
-from .paths import CONFIG_DIR
-
-
 CLAUDE_RESEARCH_MODEL = os.getenv("CLAUDE_RESEARCH_MODEL", "haiku")
 CLAUDE_REVIEW_MODEL = os.getenv("CLAUDE_REVIEW_MODEL", "haiku")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 _RESEARCH_CACHE_TTL = 30 * 60
 _research_cache: dict[str, tuple[float, str]] = {}
 _research_cache_lock = threading.Lock()
@@ -68,6 +64,12 @@ def _normalize_url(url: str) -> str:
 
 def _source_domain(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def _domain_matches(domain: str, marker: str) -> bool:
+    if marker.startswith("."):
+        return domain.endswith(marker)
+    return domain == marker or domain.endswith(f".{marker}")
 
 
 def _question_keywords(question: str) -> list[str]:
@@ -124,7 +126,7 @@ def _source_trust_score(result: dict) -> int:
         "yna.co.kr", "kbs.co.kr", "imbc.com", "sbs.co.kr",
         "donga.com", "joins.com", "chosun.com", "hani.co.kr",
     )
-    if any(marker in domain for marker in trusted_domains):
+    if any(_domain_matches(domain, marker) for marker in trusted_domains):
         score += 100
     if any(word in title for word in ("공식", "official", "프로필", "약력", "인터뷰")):
         score += 24
@@ -137,7 +139,7 @@ def _source_trust_score(result: dict) -> int:
         "fanmaum.com", "dcinside.com", "fmkorea.com", "ruliweb.com",
         "jwiki.kr",
     )
-    if any(marker in domain for marker in low_quality):
+    if any(_domain_matches(domain, marker) for marker in low_quality):
         score -= 120
     if not domain:
         score -= 200
@@ -213,20 +215,28 @@ def collect_sources(question: str, max_sources: int = 5) -> list[dict]:
     selected: list[dict] = []
     seen_urls: set[str] = set()
     seen_domains: set[str] = set()
+    seen_titles: set[str] = set()
     for result in search_results:
         url = _normalize_url(result.get("url", ""))
         domain = _source_domain(url)
+        normalized_title = re.sub(
+            r"[^0-9a-zA-Z가-힣]+", " ", str(result.get("title") or "").lower()
+        ).strip()
         if not url or url in seen_urls or not domain:
             continue
         if not _is_relevant_result(question, result):
             continue
         if domain in seen_domains:
             continue
+        if normalized_title and normalized_title in seen_titles:
+            continue
         if _source_trust_score(result) < -50:
             continue
         selected.append({**result, "url": url})
         seen_urls.add(url)
         seen_domains.add(domain)
+        if normalized_title:
+            seen_titles.add(normalized_title)
         if len(selected) >= max_sources + 2:
             break
 
@@ -354,25 +364,6 @@ def synthesize_sources_with_claude(question: str, sources: list[dict]) -> str:
         return ""
 
 
-def _load_gemini_api_key() -> str:
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if key:
-        if key.startswith("AIza") and len(key) >= 30:
-            return key
-        print("[Gemini] API 키 형식이 올바르지 않아 Claude 검수만 사용합니다.")
-        return ""
-    config_path = CONFIG_DIR / "api_keys.json"
-    try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        key = str(data.get("gemini_api_key") or "").strip()
-        if key and not (key.startswith("AIza") and len(key) >= 30):
-            print("[Gemini] 저장된 API 키 형식이 올바르지 않습니다.")
-            return ""
-        return key
-    except (OSError, ValueError, TypeError):
-        return ""
-
-
 def needs_verified_research(text: str) -> bool:
     """Return True for questions that benefit from multi-source research."""
     query = text.lower().strip()
@@ -475,106 +466,63 @@ def research_with_claude(question: str) -> str:
         return ""
 
 
-def _review_with_gemini(question: str, draft: str) -> str | None:
-    """Return a Gemini-edited answer, or None when Gemini is unavailable."""
-    if not draft.strip():
-        return None
-    api_key = _load_gemini_api_key()
-    if not api_key:
-        print("[Gemini] API 키 없음 - Claude 최종 정리로 전환합니다.")
-        return None
-
-    instruction = f"""
-당신은 사실을 새로 만드는 답변자가 아니라 한국어 편집 검수자입니다.
-
-[사용자 질문]
-{question}
-
-[Claude 조사 초안]
-{draft}
-
-[엄격한 검수 규칙]
-1. 초안에 없는 사실, 해석, 숫자, 날짜, 인물, 출처를 절대 추가하지 마세요.
-2. 숫자·고유명사·URL을 임의로 변경하거나 삭제하지 마세요.
-3. 문장 흐름, 한국어 어조, 중복 표현만 다듬으세요.
-4. 출처로 뒷받침되지 않는 단정은 완화하거나 제거하세요.
-5. 출처 간 충돌이나 불확실성은 그대로 표시하세요.
-6. 마지막 [출처] 목록을 반드시 보존하세요.
-7. 검수 설명은 쓰지 말고 최종 답변만 출력하세요.
-""".strip()
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
+def _split_research_answer(draft: str) -> tuple[str, list[str]]:
+    """Separate readable body from normalized, source-preserving URL lines."""
+    cleaned = clean_research_output(draft)
+    parts = re.split(
+        r"\n\s*(?:#{1,6}\s*)?\[?출처\]?\s*:?\s*\n",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
     )
-    payload = {
-        "contents": [{"parts": [{"text": instruction}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 1600,
-        },
-    }
-    print(f"[Gemini] 최종 문장 검수 시작 (모델: {GEMINI_MODEL})")
-    started = time.monotonic()
-    try:
-        response = requests.post(
-            url,
-            headers={"x-goog-api-key": api_key},
-            json=payload,
-            timeout=45,
-        )
-        response.raise_for_status()
-        data = response.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        reviewed = "".join(str(part.get("text") or "") for part in parts).strip()
-        if not reviewed:
-            raise ValueError("Gemini 응답이 비어 있습니다.")
-        print(f"[Gemini] 검수 완료 ({time.monotonic() - started:.1f}초)")
-        return reviewed
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        print(f"[Gemini] HTTP {status} - Claude 최종 정리로 전환합니다.")
-        return None
-    except (requests.RequestException, KeyError, IndexError, ValueError, TypeError) as exc:
-        print(f"[Gemini] 검수 실패 - Claude 최종 정리로 전환: {type(exc).__name__}")
-        return None
-
-
-def review_with_gemini(question: str, draft: str) -> str:
-    """Compatibility wrapper: return the draft if Gemini cannot review it."""
-    return _review_with_gemini(question, draft) or draft
+    body = parts[0].strip()
+    source_text = parts[1] if len(parts) > 1 else cleaned
+    source_lines: list[str] = []
+    seen_urls: set[str] = set()
+    for line in source_text.splitlines():
+        match = re.search(r"https?://[^\s)\]]+", line)
+        if not match:
+            continue
+        url = match.group(0).rstrip(".,;:")
+        if url in seen_urls:
+            continue
+        label = line[:match.start()].strip(" -:[]()")
+        label = label.replace("[", "").replace("]", "")
+        label = re.sub(r"\s+", " ", label) or _source_domain(url)
+        source_lines.append(f"- {label}: {url}")
+        seen_urls.add(url)
+        if len(source_lines) >= 5:
+            break
+    return body, source_lines
 
 
 def finalize_with_claude(question: str, draft: str) -> str:
     """Turn research notes into a clean, source-preserving final answer."""
     if not draft.strip():
         return ""
+    draft_body, source_lines = _split_research_answer(draft)
+    safe_fallback = draft_body
+    if source_lines:
+        safe_fallback += "\n\n출처\n" + "\n".join(source_lines)
 
     prompt = f"""
-당신은 자비스의 최종 답변 편집자입니다. 아래 웹 조사 초안을 사용해 사용자가
-바로 읽고 들을 수 있는 자연스러운 한국어 답변으로 다시 작성하세요.
+아래 Claude 웹 조사 초안을 최종 검수해 자연스러운 한국어 본문만 출력하세요.
 
 [사용자 질문]
 {question}
 
-[웹 조사 초안]
-{draft}
+[현재 날짜]
+{date.today().isoformat()}
+
+[검수할 본문]
+{draft_body}
 
 [편집 규칙]
 1. 초안에 없는 사실을 추가하지 마세요.
-2. 출처에서 명확히 뒷받침되지 않는 최신 수치·날짜·직함·재산·이적 정보는
-   삭제하거나 "출처별로 차이가 있다"고 표현하세요.
-3. "최다", "최초", "역대", "세계 최고" 같은 최상급 표현은 공식 출처가
-   해당 표현을 명확히 뒷받침할 때만 유지하고, 아니면 중립적으로 바꾸세요.
-4. 같은 내용을 반복하지 말고 핵심부터 설명하세요.
-5. 전체 본문은 보통 6~10문장으로 간결하게 작성하세요.
-6. Markdown 제목 기호(##, ###), 굵은 글씨 기호(**), 표는 쓰지 마세요.
-7. 마지막에는 정확히 "출처"라는 줄을 쓰고, 대표 출처 3~5개만 아래처럼
-   깨끗한 형식으로 남기세요. 중첩 링크 문법은 금지합니다.
-   - 출처명: https://example.com
-8. URL은 초안에 실제로 존재하는 URL만 사용하고 변형하지 마세요.
-9. 논쟁적이거나 출처가 충돌하는 내용은 한 문장으로 짧게 명시하세요.
-10. 검수 과정 설명 없이 최종 답변만 출력하세요.
+2. 현재 시점으로 확정할 수 없는 수치·직함·소속은 단정하지 마세요.
+3. 출처 작성 시점의 "올해", "현재", "최근"은 절대 연도로 고치세요.
+4. 반복을 제거하고 핵심부터 5~8문장으로 간결하게 정리하세요.
+5. Markdown, 제목, 목록, URL, 출처, 검수 설명은 출력하지 마세요.
 """.strip()
 
     cmd = [
@@ -603,21 +551,30 @@ def finalize_with_claude(question: str, draft: str) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=90,
+            timeout=60,
         )
         if result.returncode != 0:
-            print("[Claude 검수] 실패 - 조사 초안을 정리해서 사용합니다.")
-            return clean_research_output(draft)
+            print("[Claude 검수] 실패 - 정제된 안전 초안을 사용합니다.")
+            return safe_fallback
         data = json.loads(result.stdout.strip())
-        final = clean_research_output(str(data.get("result") or "").strip())
-        if not final or len(re.findall(r"https?://\S+", final)) < 3:
-            print("[Claude 검수] 출처 보존 실패 - 조사 초안을 정리해서 사용합니다.")
-            return clean_research_output(draft)
+        final_body = clean_research_output(str(data.get("result") or "").strip())
+        final_body = re.split(
+            r"\n\s*(?:#{1,6}\s*)?\[?출처\]?\s*:?\s*\n",
+            final_body,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        if len(final_body) < 80:
+            print("[Claude 검수] 결과 부족 - 정제된 안전 초안을 사용합니다.")
+            return safe_fallback
+        final = final_body
+        if source_lines:
+            final += "\n\n출처\n" + "\n".join(source_lines)
         print(f"[Claude 검수] 완료 ({time.monotonic() - started:.1f}초)")
         return final
     except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as exc:
-        print(f"[Claude 검수] 오류 - 조사 초안 사용: {type(exc).__name__}")
-        return clean_research_output(draft)
+        print(f"[Claude 검수] 오류 - 정제된 안전 초안 사용: {type(exc).__name__}")
+        return safe_fallback
 
 
 def clean_research_output(text: str) -> str:
@@ -648,7 +605,7 @@ def run_research_pipeline(question: str) -> str:
         print("[빠른 조사] 캐시 응답 사용")
         return cached[1]
 
-    # Fast path: collect websites in parallel, then ask Claude to write once.
+    # Fast path: collect websites in parallel, then ask Claude to synthesize.
     sources = collect_sources(question)
     draft = synthesize_sources_with_claude(question, sources)
 
@@ -658,14 +615,11 @@ def run_research_pipeline(question: str) -> str:
         researched = research_with_claude(question)
         if not researched:
             return ""
-        draft = finalize_with_claude(question, researched)
+        draft = researched
 
-    gemini_result = _review_with_gemini(question, draft)
-    if gemini_result:
-        final = clean_research_output(gemini_result)
-    else:
-        # Fast path already produced a polished final answer, so no second Claude call.
-        final = clean_research_output(draft)
+    # Always use Claude as the final reviewer. If it fails, finalize_with_claude
+    # returns only a normalized, non-raw fallback with program-verified sources.
+    final = finalize_with_claude(question, draft)
 
     with _research_cache_lock:
         _research_cache[cache_key] = (time.monotonic(), final)
