@@ -14,8 +14,6 @@ from ..paths import CONFIG_DIR
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.send",
 ]
 CREDENTIALS_PATH = CONFIG_DIR / "google_credentials.json"
 TOKEN_PATH = CONFIG_DIR / "google_token.json"
