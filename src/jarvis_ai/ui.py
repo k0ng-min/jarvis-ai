@@ -21,7 +21,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QKeySequence,
-    QPainter, QPen, QPixmap, QShortcut,
+    QPainter, QPen, QPixmap, QPolygonF, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -182,17 +182,38 @@ class HudCanvas(QWidget):
         self._face_px: QPixmap | None = None
         if face_path: self._load_face(face_path)
 
-        # 볼류메트릭 구형 파티클 (내부까지 꽉 찬 점구름)
+        # 표면형 구체 파티클:
+        # 내부를 채우는 점구름 대신 얇은 구면 쉘을 촘촘하게 구성하고,
+        # 참고 이미지처럼 위·아래 극점의 밀도와 밝기를 높인다.
         rng = random.Random(7)
-        self._vol_pts: list[tuple[float, float, float, float]] = []  # x,y,z,edge
-        while len(self._vol_pts) < 1600:
-            x = rng.uniform(-1, 1)
-            y = rng.uniform(-1, 1)
-            z = rng.uniform(-1, 1)
-            d2 = x*x + y*y + z*z
-            if d2 <= 1.0:
-                # edge: 표면에 가까울수록 1 (밝음), 중심은 0 (어두움)
-                self._vol_pts.append((x, y, z, d2))
+        self._vol_pts: list[tuple[float, float, float, float]] = []
+
+        # 균일한 구면 표면 — Fibonacci sphere로 빈 구역 없이 촘촘하게 배치.
+        shell_count = 3800
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+        for i in range(shell_count):
+            y = 1.0 - 2.0 * ((i + 0.5) / shell_count)
+            radial = math.sqrt(max(0.0, 1.0 - y * y))
+            theta = i * golden_angle + rng.uniform(-0.035, 0.035)
+            radius = rng.uniform(0.975, 1.015)
+            x = math.cos(theta) * radial * radius
+            z = math.sin(theta) * radial * radius
+            # 극점에 가까울수록 밝아지는 가중치.
+            pole = abs(y) ** 2.6
+            self._vol_pts.append((x, y * radius, z, pole))
+
+        # 위·아래 극점에 미세한 추가 파티클을 배치해 눈처럼 쌓인 밀도 표현.
+        for pole_sign in (-1.0, 1.0):
+            for _ in range(700):
+                cap_distance = rng.random() ** 2.2
+                y = pole_sign * (1.0 - cap_distance * 0.34)
+                radial = math.sqrt(max(0.0, 1.0 - y * y))
+                theta = rng.uniform(0.0, math.tau)
+                radius = rng.uniform(0.985, 1.02)
+                x = math.cos(theta) * radial * radius
+                z = math.sin(theta) * radial * radius
+                pole = 0.78 + (1.0 - cap_distance) * 0.22
+                self._vol_pts.append((x, y * radius, z, pole))
         self._vol_rot = 0.0   # Y축 회전각
 
         # 홀로그램 텍스트 (음성 대화 표시)
@@ -331,30 +352,40 @@ class HudCanvas(QWidget):
         cos_r = math.cos(self._vol_rot)
         sin_r = math.sin(self._vol_rot)
 
-        rendered: list[tuple[float,float,float,float,float]] = []
-        for x, y, z, d2 in self._vol_pts:
+        # 점을 밝기별 버킷으로 묶어 drawPoints 한 번씩만 호출한다.
+        # 5천 개 이상의 점을 개별 drawEllipse로 그리는 것보다 훨씬 빠르다.
+        point_buckets: list[list[QPointF]] = [[] for _ in range(12)]
+        for x, y, z, pole in self._vol_pts:
             rx = x * cos_r + z * sin_r
             rz = -x * sin_r + z * cos_r
             sx = cx + rx * sph_r
             sy = cy - y  * sph_r
             depth  = (rz + 1) * 0.5
-            edge   = d2
-            # 표면 집중 + 앞면 강조
-            bright = edge ** 0.45 * 0.78 + depth * 0.22
-            alpha  = max(0, min(255, int(halo * bright ** 0.42)))
-            sz = 0.5 + bright * 2.8
-            rendered.append((rz, sx, sy, sz, alpha))
+            projected_radius = min(1.0, math.sqrt(rx * rx + y * y))
+            # 중심부는 어둡게, 외곽 실루엣과 위·아래 극점은 선명하게.
+            limb = projected_radius ** 2.8
+            front = 0.22 + depth * 0.34
+            bright = min(1.0, front + limb * 0.46 + pole * 0.72)
+            alpha_scale = 0.42 + limb * 0.40 + pole * 0.72
+            alpha = max(0, min(255, int(halo * alpha_scale * bright)))
+            bucket = min(11, max(0, int(alpha / 256 * 12)))
+            point_buckets[bucket].append(QPointF(sx, sy))
 
-        rendered.sort(key=lambda d: d[0])
-        p.setPen(Qt.PenStyle.NoPen)
-        for _, sx, sy, sz, alpha in rendered:
-            # 답변 중에는 점 구체 자체가 밝은 파랑으로 전환된다.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for bucket, points in enumerate(point_buckets):
+            if not points:
+                continue
+            strength = (bucket + 1) / 12
+            alpha = int(28 + strength * 227)
+            width = 0.65 + strength * 2.35
             if self.speaking:
                 point_color = QColor(80, 190, 255, alpha)
             else:
                 point_color = QColor(255, 255, 255, alpha)
-            p.setBrush(QBrush(point_color))
-            p.drawEllipse(QPointF(sx, sy), sz, sz)
+            pen = QPen(point_color, width)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawPoints(QPolygonF(points))
 
         # ── glow halo (구체 뒤 은은한 빛) ──
         from PyQt6.QtGui import QRadialGradient
@@ -367,6 +398,7 @@ class HudCanvas(QWidget):
             grad.setColorAt(0.0, QColor(255, 255, 255, min(60, int(halo * 0.35))))
             grad.setColorAt(0.55, QColor(200, 220, 255, min(25, int(halo * 0.14))))
         grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(grad))
         p.drawEllipse(QPointF(cx, cy), glow_r, glow_r)
 
