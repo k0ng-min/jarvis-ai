@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import html
 import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -23,7 +25,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -234,13 +236,20 @@ class HudCanvas(QWidget):
             # 입력이 끊기면 빠르게 원래 크기로 돌아오고, 목소리에는 부드럽게 반응한다.
             if now - self._last_mic_level_at > 0.18:
                 self.mic_level = 0.0
-            smoothing = 0.36 if self.mic_level > self._mic_level_smoothed else 0.16
+            smoothing = 0.48 if self.mic_level > self._mic_level_smoothed else 0.20
             self._mic_level_smoothed += (
                 self.mic_level - self._mic_level_smoothed
             ) * smoothing
             voice = self._mic_level_smoothed
-            self._tgt_scale = 0.96 + breath * 0.06 + voice * 0.34
-            self._tgt_halo = 75.0 + breath * 25.0 + voice * 125.0
+            # 실제 발화 음량이 중심 구체의 확대·수축에 직접 반영된다.
+            voice_flutter = math.sin(self._tick * 0.22) * voice * 0.035
+            self._tgt_scale = 0.95 + breath * 0.05 + voice * 0.48 + voice_flutter
+            self._tgt_halo = 70.0 + breath * 22.0 + voice * 165.0
+        elif self.state in ("생각 중", "처리 중"):
+            # 분석 중에는 크기 변화보다 정밀한 맥동과 궤도 회전을 강조한다.
+            analysis_wave = math.sin(self._tick * 0.055) * 0.5 + 0.5
+            self._tgt_scale = 0.98 + analysis_wave * 0.055
+            self._tgt_halo = 105.0 + analysis_wave * 42.0
         else:
             self._tgt_scale = 0.96 + breath * 0.10           # 0.96~1.06
             self._tgt_halo  = 80.0 + breath * 30.0
@@ -255,7 +264,14 @@ class HudCanvas(QWidget):
         self._pal_g += (tg - self._pal_g) * spd_c
         self._pal_b += (tb - self._pal_b) * spd_c
 
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
+        if self.speaking:
+            speeds = [1.3, -0.9, 2.0]
+        elif self.state in ("생각 중", "처리 중"):
+            speeds = [2.5, -1.9, 3.3]
+        elif self.state == "듣는 중" and self._mic_level_smoothed > 0.06:
+            speeds = [1.0, -0.7, 1.55]
+        else:
+            speeds = [0.55, -0.35, 0.9]
         for i, spd in enumerate(speeds):
             self._rings[i] = (self._rings[i] + spd) % 360
         self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
@@ -349,6 +365,48 @@ class HudCanvas(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(pw(a)))
             p.drawEllipse(QPointF(pt[0], pt[1]), 2.0, 2.0)
+
+        # ── 생각/처리 중: 교차하는 분석 궤도 ──
+        if self.state in ("생각 중", "처리 중"):
+            orbit_color = QColor(r, g, b, 150)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.save()
+            p.translate(cx, cy)
+            for i, angle in enumerate((self._scan, self._scan2, self._rings[2])):
+                p.save()
+                p.rotate(angle + i * 60)
+                p.setPen(QPen(orbit_color, 1.2 if i < 2 else 0.8))
+                orbit_w = sph_r * (2.45 + i * 0.20)
+                orbit_h = sph_r * (0.72 + i * 0.16)
+                p.drawEllipse(QRectF(-orbit_w / 2, -orbit_h / 2, orbit_w, orbit_h))
+                marker_x = math.cos(self._tick * 0.045 + i * 2.1) * orbit_w / 2
+                marker_y = math.sin(self._tick * 0.045 + i * 2.1) * orbit_h / 2
+                p.setBrush(QBrush(QColor(230, 190, 255, 220)))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QPointF(marker_x, marker_y), 2.6, 2.6)
+                p.restore()
+            p.restore()
+
+        # ── 답변 중: 방사형 음성 스펙트럼 ──
+        if self.speaking:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            bars = 40
+            inner = sph_r * 1.17
+            for i in range(bars):
+                angle = (math.tau * i / bars) - math.pi / 2
+                activity = (
+                    math.sin(self._tick * 0.18 + i * 0.72) * 0.5 + 0.5
+                )
+                activity *= 0.55 + (
+                    math.sin(self._tick * 0.07 + i * 1.31) * 0.5 + 0.5
+                ) * 0.45
+                length = 7.0 + activity * 22.0
+                x1 = cx + math.cos(angle) * inner
+                y1 = cy + math.sin(angle) * inner
+                x2 = cx + math.cos(angle) * (inner + length)
+                y2 = cy + math.sin(angle) * (inner + length)
+                p.setPen(QPen(QColor(60, 165, 255, 105 + int(activity * 145)), 2.0))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
         # 텍스트 오버레이 없음 (채팅 패널로 이동)
 
@@ -545,7 +603,7 @@ class SetupOverlay(QWidget):
 # ─── 미니 채팅 패널 ──────────────────────────────────────────────────────────
 
 class MiniChatPanel(QWidget):
-    """흰색 테마 채팅 패널 — 대화 내역 + 입력창"""
+    """JARVIS HUD와 어울리는 채팅 패널."""
     submitted = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -556,15 +614,15 @@ class MiniChatPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── 컨테이너 (흰색 카드) ──
+        # ── 컨테이너 ──
         card = QWidget()
         card.setObjectName("chat_card")
-        card.setStyleSheet("""
-            QWidget#chat_card {
-                background: rgba(255,255,255,240);
-                border-radius: 16px;
-                border: 1px solid rgba(0,0,0,0.08);
-            }
+        card.setStyleSheet(f"""
+            QWidget#chat_card {{
+                background: rgba(1, 13, 20, 246);
+                border-radius: 18px;
+                border: 1px solid {C.BORDER_B};
+            }}
         """)
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(0, 0, 0, 0)
@@ -572,64 +630,84 @@ class MiniChatPanel(QWidget):
 
         # 헤더
         hdr = QWidget()
-        hdr.setFixedHeight(42)
+        hdr.setFixedHeight(58)
         hdr.setStyleSheet("background: transparent;")
         hdr_lay = QHBoxLayout(hdr)
-        hdr_lay.setContentsMargins(16, 0, 12, 0)
-        title = QLabel("JARVIS")
-        title.setFont(QFont("Arial", 13, QFont.Weight.Bold))
-        title.setStyleSheet("color: #111; background: transparent;")
-        hdr_lay.addWidget(title)
+        hdr_lay.setContentsMargins(16, 0, 14, 0)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        title = QLabel("JARVIS CHAT")
+        title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+        title_box.addWidget(title)
+        self._status = QLabel("채팅 중 · 마이크 일시 정지")
+        self._status.setFont(QFont("Arial", 8))
+        self._status.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        title_box.addWidget(self._status)
+        hdr_lay.addLayout(title_box)
         hdr_lay.addStretch()
-        sub = QLabel("AI 어시스턴트")
-        sub.setFont(QFont("Arial", 9))
-        sub.setStyleSheet("color: #888; background: transparent;")
+        sub = QLabel("TEXT MODE")
+        sub.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        sub.setStyleSheet(f"""
+            color: {C.PRI};
+            background: {C.PRI_GHO};
+            border: 1px solid {C.PRI_DIM};
+            border-radius: 8px;
+            padding: 3px 7px;
+        """)
         hdr_lay.addWidget(sub)
         card_lay.addWidget(hdr)
 
         # 구분선
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet("color: rgba(0,0,0,0.08);")
+        div.setStyleSheet(f"color: {C.BORDER};")
         card_lay.addWidget(div)
 
         # 대화 영역
-        self._log = QTextEdit()
+        self._log = QTextBrowser()
         self._log.setReadOnly(True)
-        self._log.setFont(QFont("Apple SD Gothic Neo, Malgun Gothic, Arial", 12))
-        self._log.setStyleSheet("""
-            QTextEdit {
+        self._log.setOpenExternalLinks(True)
+        self._log.setFont(QFont("Malgun Gothic", 10))
+        self._log.setStyleSheet(f"""
+            QTextBrowser {{
                 background: transparent;
-                color: #222;
+                color: {C.WHITE};
                 border: none;
-                padding: 10px 14px;
-            }
-            QScrollBar:vertical { width: 4px; background: transparent; }
-            QScrollBar::handle:vertical { background: rgba(0,0,0,0.15); border-radius: 2px; }
+                padding: 14px 12px;
+            }}
+            QScrollBar:vertical {{ width: 4px; background: transparent; }}
+            QScrollBar::handle:vertical {{
+                background: {C.PRI_DIM};
+                border-radius: 2px;
+            }}
         """)
-        self._log.setPlaceholderText("대화가 여기에 표시됩니다...")
+        self._log.setPlaceholderText("메시지를 입력하면 대화가 여기에 표시됩니다.")
         card_lay.addWidget(self._log, 1)
 
         # 입력 영역
         inp_area = QWidget()
-        inp_area.setFixedHeight(52)
+        inp_area.setFixedHeight(62)
         inp_area.setStyleSheet("background: transparent;")
         inp_lay = QHBoxLayout(inp_area)
-        inp_lay.setContentsMargins(10, 8, 10, 8)
+        inp_lay.setContentsMargins(12, 10, 12, 10)
         inp_lay.setSpacing(8)
 
         self._input = QLineEdit()
-        self._input.setPlaceholderText("메시지 입력...")
+        self._input.setPlaceholderText("자비스에게 메시지 보내기")
         self._input.setFont(QFont("Apple SD Gothic Neo, Malgun Gothic, Arial", 12))
-        self._input.setStyleSheet("""
-            QLineEdit {
-                background: rgba(0,0,0,0.06);
-                color: #111;
-                border: none;
-                border-radius: 20px;
+        self._input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C.DARK};
+                color: {C.WHITE};
+                border: 1px solid {C.BORDER};
+                border-radius: 19px;
                 padding: 6px 16px;
-            }
-            QLineEdit:focus { background: rgba(0,0,0,0.09); }
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {C.PRI};
+                background: {C.PRI_GHO};
+            }}
         """)
         self._input.returnPressed.connect(self._send)
         inp_lay.addWidget(self._input)
@@ -638,14 +716,14 @@ class MiniChatPanel(QWidget):
         send_btn.setFixedSize(34, 34)
         send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         send_btn.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        send_btn.setStyleSheet("""
-            QPushButton {
-                background: #111;
-                color: white;
+        send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PRI};
+                color: #001018;
                 border: none;
                 border-radius: 17px;
-            }
-            QPushButton:hover { background: #333; }
+            }}
+            QPushButton:hover {{ background: {C.WHITE}; }}
         """)
         send_btn.clicked.connect(self._send)
         inp_lay.addWidget(send_btn)
@@ -661,13 +739,45 @@ class MiniChatPanel(QWidget):
 
     def focus(self): self._input.setFocus()
 
+    @staticmethod
+    def _message_html(text: str) -> str:
+        safe = html.escape(text)
+        safe = re.sub(
+            r"(https?://[^\s<]+)",
+            r'<a style="color:#00d4ff" href="\1">\1</a>',
+            safe,
+        )
+        return safe.replace("\n", "<br>")
+
     def append_user(self, text: str):
-        self._log.append(f'<p style="color:#111;margin:4px 0"><b>나</b>&nbsp;&nbsp;{text}</p>')
+        body = self._message_html(text)
+        self._log.append(f"""
+            <div style="margin:8px 0 8px 36px; padding:9px 12px;
+                        background:#063447; color:#e8fbff;
+                        border-radius:12px;">
+                <div style="font-size:9px; color:#70dfff; margin-bottom:4px;">YOU</div>
+                {body}
+            </div>
+        """)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
     def append_jarvis(self, text: str):
-        self._log.append(f'<p style="color:#555;margin:4px 0"><b>자비스</b>&nbsp;&nbsp;{text}</p>')
+        body = self._message_html(text)
+        self._log.append(f"""
+            <div style="margin:8px 36px 8px 0; padding:10px 12px;
+                        background:#071820; color:#d8f8ff;
+                        border-left:3px solid #00d4ff; border-radius:10px;">
+                <div style="font-size:9px; color:#00d4ff; margin-bottom:4px;">JARVIS</div>
+                {body}
+            </div>
+        """)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+
+    def set_status(self, text: str, busy: bool = False):
+        self._status.setText(text)
+        self._status.setStyleSheet(
+            f"color: {C.ACC2 if busy else C.GREEN}; background: transparent;"
+        )
 
 
 # ─── 채팅 버튼 (우하단 원형) ─────────────────────────────────────────────────
@@ -729,6 +839,7 @@ class MainWindow(QMainWindow):
 
         self._muted      = False
         self._chat_open  = False
+        self._chat_mode_event = threading.Event()
         self._overlay: SetupOverlay | None = None
         self.on_text_command = None
 
@@ -751,7 +862,7 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
         self._usr_sig.connect(lambda t: self.hud.set_hud_user(t))
         self._jrv_sig.connect(lambda t: self.hud.set_hud_jarvis(t))
-        self._chat_log_sig.connect(lambda pair: self._chat_panel.append_jarvis(pair[1]))
+        self._chat_log_sig.connect(self._append_chat_message)
         self._mic_sig.connect(self._on_mic_level)
 
         # 단축키
@@ -786,10 +897,20 @@ class MainWindow(QMainWindow):
         self._chat_open = not self._chat_open
         self._chat_btn.set_open(self._chat_open)
         if self._chat_open:
+            self._chat_mode_event.set()
+            self._chat_panel.set_status("채팅 중 · 마이크 일시 정지")
             self._chat_panel.show(); self._chat_panel.raise_()
             self._chat_panel.focus()
         else:
+            self._chat_mode_event.clear()
             self._chat_panel.hide()
+
+    def _append_chat_message(self, pair: tuple):
+        role, text = pair
+        if role == "user":
+            self._chat_panel.append_user(text)
+        else:
+            self._chat_panel.append_jarvis(text)
 
     def _on_chat_submit(self, text: str):
         self._chat_panel.append_user(text)
@@ -845,6 +966,15 @@ class MainWindow(QMainWindow):
         state = state_map.get(state, state)
         self.hud.state = state
         self.hud.speaking = state in ("말하는 중", "SPEAKING")
+        if self._chat_open:
+            status = {
+                "생각 중": "답변을 생각하는 중…",
+                "처리 중": "요청을 처리하는 중…",
+                "말하는 중": "답변 완료",
+            }.get(state, "채팅 중 · 마이크 일시 정지")
+            self._chat_panel.set_status(
+                status, busy=state in ("생각 중", "처리 중")
+            )
 
 
 # ─── 공개 API ────────────────────────────────────────────────────────────────
@@ -865,6 +995,8 @@ class JarvisUI:
     @property
     def muted(self) -> bool: return self._win._muted
     @property
+    def chat_active(self) -> bool: return self._win._chat_mode_event.is_set()
+    @property
     def speaking(self) -> bool: return self._win.hud.speaking
     @property
     def state(self) -> str: return self._win.hud.state
@@ -883,8 +1015,9 @@ class JarvisUI:
         if text.startswith("나: "):
             self._win._usr_sig.emit(text[3:120])
         elif text.startswith("자비스: "):
-            self._win._jrv_sig.emit(text[5:220])
-            self._win._chat_log_sig.emit(("jarvis", text[5:220]))
+            full_text = text[5:]
+            self._win._jrv_sig.emit(full_text[:220])
+            self._win._chat_log_sig.emit(("jarvis", full_text))
 
     def wait_for_api_key(self):
         while not self._win._ready: time.sleep(0.1)

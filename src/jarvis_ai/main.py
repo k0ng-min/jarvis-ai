@@ -313,14 +313,19 @@ def speak_text(
 class _LevelMonitoringStream:
     """SpeechRecognition이 읽는 PCM에서 실시간 음량을 측정하는 스트림 래퍼."""
 
-    def __init__(self, stream, callback, sample_width: int):
+    def __init__(self, stream, callback, sample_width: int, cancel_check=None):
         self._stream = stream
         self._callback = callback
         self._sample_width = sample_width
         self._last_emit = 0.0
+        self._cancel_check = cancel_check
 
     def read(self, size):
+        if self._cancel_check and self._cancel_check():
+            raise ChatModeActivated()
         data = self._stream.read(size)
+        if self._cancel_check and self._cancel_check():
+            raise ChatModeActivated()
         now = time.monotonic()
         if now - self._last_emit >= 0.03:
             self._last_emit = now
@@ -345,9 +350,15 @@ class _LevelMonitoringStream:
             return 0.0
 
 
+class ChatModeActivated(Exception):
+    """Raised to stop an active microphone read when chat mode opens."""
+
+
 def listen_mic(ui: JarvisUI | None = None) -> str:
     """마이크 입력을 받아 텍스트로 변환 (한국어 최적화 + 음량 표시)"""
     global MIC_INDEX
+    if ui and ui.chat_active:
+        return ""
     recognizer = sr.Recognizer()
     recognizer.energy_threshold = 220
     recognizer.dynamic_energy_threshold = True
@@ -382,7 +393,10 @@ def listen_mic(ui: JarvisUI | None = None) -> str:
                         ui.set_mic_level(level)
 
                     source.stream = _LevelMonitoringStream(
-                        raw_stream, emit_level, source.SAMPLE_WIDTH
+                        raw_stream,
+                        emit_level,
+                        source.SAMPLE_WIDTH,
+                        cancel_check=lambda: ui.chat_active,
                     )
 
                 audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
@@ -401,6 +415,11 @@ def listen_mic(ui: JarvisUI | None = None) -> str:
                     ui.set_mic_level(0.0)  # 인식 완료 후 음량 리셋
                 return text
 
+            except ChatModeActivated:
+                print("[STT] 채팅 모드 활성화 - 마이크 입력 중지")
+                if ui:
+                    ui.set_mic_level(0.0)
+                return ""
             except sr.WaitTimeoutError:
                 print(f"[STT] ⏱️ 입력 없음")
                 if ui:
@@ -428,6 +447,8 @@ def listen_mic(ui: JarvisUI | None = None) -> str:
 def listen_mic_with_retry(ui=None, max_retries=2, retry_delays=[0.3, 0.5]):
     """STT with retry logic - 호환성 래퍼"""
     for attempt in range(max_retries):
+        if ui and ui.chat_active:
+            return "", STTStatus.TIMEOUT
         text = listen_mic(ui)
         if text:
             return text, STTStatus.SUCCESS
@@ -1099,6 +1120,9 @@ class JarvisAssistant:
             try:
                 if self.ui.muted:
                     time.sleep(0.3)
+                    continue
+                if self.ui.chat_active:
+                    time.sleep(0.05)
                     continue
                 if _tts_active.is_set() or self._interaction_busy.is_set():
                     time.sleep(0.05)

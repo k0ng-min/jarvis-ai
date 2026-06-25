@@ -107,3 +107,17 @@ $env:GEMINI_API_KEY="발급받은 키"
 ## 주의
 
 컴퓨터 제어 기능은 사용자 PC에서 실제 동작을 수행합니다. 신뢰할 수 있는 환경에서 사용하고, 중요한 명령은 실행 결과를 직접 확인하세요.
+
+## 개발 브랜치 절차
+
+기능 변경은 `main`에 직접 커밋하지 않습니다.
+
+```bash
+git switch main
+git pull
+git switch -c feature/기능명
+# 구현 및 테스트
+git push -u origin feature/기능명
+```
+
+테스트가 통과하고 실제 동작을 확인한 뒤에만 `main`으로 병합합니다.
