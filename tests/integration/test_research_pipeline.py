@@ -3,6 +3,8 @@
 import os
 
 from jarvis_ai.research_pipeline import (
+    clean_research_output,
+    finalize_with_claude,
     needs_verified_research,
     research_text_for_speech,
     review_with_gemini,
@@ -23,6 +25,12 @@ def run():
         spoken = research_text_for_speech(draft)
         assert spoken == "초안입니다."
         assert "http" not in spoken
+        malformed = (
+            "[공식 사이트]([https://example.com/a]"
+            "(https://example.com/a\\))"
+        )
+        cleaned = clean_research_output(malformed)
+        assert cleaned == "공식 사이트: https://example.com/a"
     finally:
         if previous is not None:
             os.environ["GEMINI_API_KEY"] = previous

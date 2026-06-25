@@ -285,7 +285,6 @@ def speak_text(
     """동기 방식으로 TTS 재생 + 홀로그램 텍스트 표시"""
     if not text or not text.strip():
         return
-    text_only_mode = bool(ui and ui.chat_active)
     # 여러 응답이 겹쳐 재생되거나, TTS 중 마이크가 자기 목소리를 듣지 않게 한다.
     with _tts_lock:
         _tts_active.set()
@@ -293,14 +292,13 @@ def speak_text(
             ui.set_state("SPEAKING")
             ui.write_log(f"자비스: {display_text or text}")
         try:
-            if not text_only_mode:
-                # 스레드에서 호출 시 새 이벤트 루프 생성
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(_speak_async(text))
-                finally:
-                    loop.close()
+            # 채팅 모드에서도 답변 음성은 재생한다. 마이크만 별도로 정지된다.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_speak_async(text))
+            finally:
+                loop.close()
         except Exception as e:
             print(f"[TTS] ❌ {e}")
         finally:

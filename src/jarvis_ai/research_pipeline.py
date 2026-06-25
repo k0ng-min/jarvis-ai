@@ -15,17 +15,25 @@ from .paths import CONFIG_DIR
 
 
 CLAUDE_RESEARCH_MODEL = os.getenv("CLAUDE_RESEARCH_MODEL", "haiku")
+CLAUDE_REVIEW_MODEL = os.getenv("CLAUDE_REVIEW_MODEL", "haiku")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 
 def _load_gemini_api_key() -> str:
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if key:
-        return key
+        if key.startswith("AIza") and len(key) >= 30:
+            return key
+        print("[Gemini] API 키 형식이 올바르지 않아 Claude 검수만 사용합니다.")
+        return ""
     config_path = CONFIG_DIR / "api_keys.json"
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
-        return str(data.get("gemini_api_key") or "").strip()
+        key = str(data.get("gemini_api_key") or "").strip()
+        if key and not (key.startswith("AIza") and len(key) >= 30):
+            print("[Gemini] 저장된 API 키 형식이 올바르지 않습니다.")
+            return ""
+        return key
     except (OSError, ValueError, TypeError):
         return ""
 
@@ -132,14 +140,14 @@ def research_with_claude(question: str) -> str:
         return ""
 
 
-def review_with_gemini(question: str, draft: str) -> str:
-    """Polish a sourced draft without allowing Gemini to add new facts."""
+def _review_with_gemini(question: str, draft: str) -> str | None:
+    """Return a Gemini-edited answer, or None when Gemini is unavailable."""
     if not draft.strip():
-        return ""
+        return None
     api_key = _load_gemini_api_key()
     if not api_key:
-        print("[Gemini] API 키 없음 - Claude 조사 결과를 그대로 사용합니다.")
-        return draft
+        print("[Gemini] API 키 없음 - Claude 최종 정리로 전환합니다.")
+        return None
 
     instruction = f"""
 당신은 사실을 새로 만드는 답변자가 아니라 한국어 편집 검수자입니다.
@@ -190,26 +198,134 @@ def review_with_gemini(question: str, draft: str) -> str:
         return reviewed
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
-        print(f"[Gemini] HTTP {status} - Claude 결과를 사용합니다.")
-        return draft
+        print(f"[Gemini] HTTP {status} - Claude 최종 정리로 전환합니다.")
+        return None
     except (requests.RequestException, KeyError, IndexError, ValueError, TypeError) as exc:
-        print(f"[Gemini] 검수 실패 - Claude 결과 사용: {type(exc).__name__}")
-        return draft
+        print(f"[Gemini] 검수 실패 - Claude 최종 정리로 전환: {type(exc).__name__}")
+        return None
+
+
+def review_with_gemini(question: str, draft: str) -> str:
+    """Compatibility wrapper: return the draft if Gemini cannot review it."""
+    return _review_with_gemini(question, draft) or draft
+
+
+def finalize_with_claude(question: str, draft: str) -> str:
+    """Turn research notes into a clean, source-preserving final answer."""
+    if not draft.strip():
+        return ""
+
+    prompt = f"""
+당신은 자비스의 최종 답변 편집자입니다. 아래 웹 조사 초안을 사용해 사용자가
+바로 읽고 들을 수 있는 자연스러운 한국어 답변으로 다시 작성하세요.
+
+[사용자 질문]
+{question}
+
+[웹 조사 초안]
+{draft}
+
+[편집 규칙]
+1. 초안에 없는 사실을 추가하지 마세요.
+2. 출처에서 명확히 뒷받침되지 않는 최신 수치·날짜·직함·재산·이적 정보는
+   삭제하거나 "출처별로 차이가 있다"고 표현하세요.
+3. "최다", "최초", "역대", "세계 최고" 같은 최상급 표현은 공식 출처가
+   해당 표현을 명확히 뒷받침할 때만 유지하고, 아니면 중립적으로 바꾸세요.
+4. 같은 내용을 반복하지 말고 핵심부터 설명하세요.
+5. 전체 본문은 보통 6~10문장으로 간결하게 작성하세요.
+6. Markdown 제목 기호(##, ###), 굵은 글씨 기호(**), 표는 쓰지 마세요.
+7. 마지막에는 정확히 "출처"라는 줄을 쓰고, 대표 출처 3~5개만 아래처럼
+   깨끗한 형식으로 남기세요. 중첩 링크 문법은 금지합니다.
+   - 출처명: https://example.com
+8. URL은 초안에 실제로 존재하는 URL만 사용하고 변형하지 마세요.
+9. 논쟁적이거나 출처가 충돌하는 내용은 한 문장으로 짧게 명시하세요.
+10. 검수 과정 설명 없이 최종 답변만 출력하세요.
+""".strip()
+
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", CLAUDE_REVIEW_MODEL,
+        "--effort", "low",
+        "--tools", "",
+        "--permission-mode", "dontAsk",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--prompt-suggestions", "false",
+        "--no-session-persistence",
+    ]
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    print(f"[Claude 검수] 조사 결과 최종 정리 시작 (모델: {CLAUDE_REVIEW_MODEL})")
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=90,
+        )
+        if result.returncode != 0:
+            print("[Claude 검수] 실패 - 조사 초안을 정리해서 사용합니다.")
+            return clean_research_output(draft)
+        data = json.loads(result.stdout.strip())
+        final = clean_research_output(str(data.get("result") or "").strip())
+        if not final or len(re.findall(r"https?://\S+", final)) < 3:
+            print("[Claude 검수] 출처 보존 실패 - 조사 초안을 정리해서 사용합니다.")
+            return clean_research_output(draft)
+        print(f"[Claude 검수] 완료 ({time.monotonic() - started:.1f}초)")
+        return final
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as exc:
+        print(f"[Claude 검수] 오류 - 조사 초안 사용: {type(exc).__name__}")
+        return clean_research_output(draft)
+
+
+def clean_research_output(text: str) -> str:
+    """Normalize malformed nested Markdown links and excessive decoration."""
+    cleaned = text.strip()
+    # [label]([url](url\)) 같은 Claude 도구 출력의 중첩 링크를 단순 출처로 변환.
+    cleaned = re.sub(
+        r"\[([^\]]+)\]\(\[(https?://[^\]]+)\]\(https?://[^)]+\)(?:\\)?\)",
+        r"\1: \2",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)(?:\\)?\)",
+        r"\1: \2",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?m)^\s*#{1,6}\s*", "", cleaned)
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def run_research_pipeline(question: str) -> str:
     draft = research_with_claude(question)
     if not draft:
         return ""
-    return review_with_gemini(question, draft)
+    gemini_result = _review_with_gemini(question, draft)
+    if gemini_result:
+        return clean_research_output(gemini_result)
+    return finalize_with_claude(question, draft)
 
 
 def research_text_for_speech(answer: str) -> str:
-    """Remove the source list so TTS does not read URLs aloud."""
+    """Read only a concise opening summary and never speak URLs."""
     body = re.split(
         r"\n\s*(?:#{1,6}\s*)?\[?출처\]?\s*:?\s*\n",
         answer,
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0].strip()
-    return re.sub(r"https?://\S+", "", body).strip() or answer
+    body = re.sub(r"https?://\S+", "", body)
+    body = re.sub(r"(?m)^\s*[-*]\s*", "", body)
+    body = body.replace("**", "").replace("#", "")
+    sentences = re.split(r"(?<=[.!?다요])\s+", body.strip())
+    concise = " ".join(sentence for sentence in sentences[:4] if sentence).strip()
+    return concise or body.strip() or answer

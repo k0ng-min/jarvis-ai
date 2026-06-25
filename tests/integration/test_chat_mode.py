@@ -94,16 +94,18 @@ def run():
 
     fake_ui = FakeUI()
     original_speak_async = main_module._speak_async
+    spoken = []
 
-    async def fail_if_called(text):
-        raise AssertionError("채팅 모드에서 TTS가 호출됐습니다.")
+    async def capture_speech(text):
+        spoken.append(text)
 
-    main_module._speak_async = fail_if_called
+    main_module._speak_async = capture_speech
     try:
         main_module.speak_text("채팅 즉시 응답", fake_ui)
     finally:
         main_module._speak_async = original_speak_async
     assert fake_ui.logs == ["자비스: 채팅 즉시 응답"]
+    assert spoken == ["채팅 즉시 응답"]
 
     import jarvis_ai.conversation_history as history_module
     original_history_file = history_module.HISTORY_FILE
