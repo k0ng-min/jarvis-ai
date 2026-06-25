@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *.pyd
+*.egg-info/
+build/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -20,6 +23,7 @@ memory/long_term.json
 
 # Runtime output
 test_logs/
+logs/
 *.log
 *.wav
 *.mp3
@@ -31,4 +35,3 @@ test_logs/
 .DS_Store
 Thumbs.db
 desktop.ini
-

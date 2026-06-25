@@ -27,7 +27,7 @@
 ```bash
 git clone https://github.com/k0ng-min/jarvis-ai.git
 cd jarvis-ai
-python setup.py
+python scripts/bootstrap.py
 ```
 
 Claude CLI를 설치하고 로그인합니다.
@@ -43,6 +43,13 @@ claude
 python main.py
 ```
 
+패키지 설치 후에는 아래 방식도 사용할 수 있습니다.
+
+```bash
+jarvis-ai
+python -m jarvis_ai
+```
+
 실행 후 다음처럼 말할 수 있습니다.
 
 - `자비스 안녕`
@@ -55,12 +62,24 @@ python main.py
 ## 테스트
 
 ```bash
-python -m py_compile main.py ui.py
-python test_realtime_tools.py
-python test_claude_quality.py
+python -m compileall -q src tests main.py
+python scripts/run_test.py tests/integration/test_realtime_tools.py
+python scripts/run_test.py tests/integration/test_claude_quality.py
 ```
 
 `test_claude_quality.py`는 실제 Claude API 사용량이 발생할 수 있습니다.
+
+## 프로젝트 구조
+
+```text
+src/jarvis_ai/     제품 코드
+tests/integration/ 자동·통합 테스트
+tests/manual/      마이크·UI 수동 테스트
+scripts/           진단 및 개발 스크립트
+docs/archive/      과거 분석 자료
+config/            로컬 설정
+memory/            로컬 장기 기억
+```
 
 ## 설정 및 개인정보
 
@@ -79,4 +98,3 @@ python test_claude_quality.py
 ## 주의
 
 컴퓨터 제어 기능은 사용자 PC에서 실제 동작을 수행합니다. 신뢰할 수 있는 환경에서 사용하고, 중요한 명령은 실행 결과를 직접 확인하세요.
-
