@@ -1,9 +1,15 @@
 """Verified external action routing tests."""
 
+import json
+from types import SimpleNamespace
+
 from jarvis_ai.actions.gmail import _send, gmail_action
+from jarvis_ai import main as main_module
 from jarvis_ai.main import (
     _block_unverified_success,
     _fast_route,
+    _finalize_tool_result,
+    _is_stop_speech,
 )
 
 
@@ -55,6 +61,34 @@ def run():
         "Gmail에 접속해서 이메일을 보내드리겠습니다.",
     )
     assert "실제 도구의 성공 결과가 없어" in blocked
+    assert _is_stop_speech("자비스 그만")
+    assert _is_stop_speech("자비스, 멈춰!")
+
+    original_run = main_module.subprocess.run
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "result": (
+                    "손흥민의 최근 경기는 체코전입니다.\n"
+                    "- 공식 출처: https://example.com/match"
+                )
+            }, ensure_ascii=False),
+            stderr="",
+        )
+
+    main_module.subprocess.run = fake_run
+    try:
+        finalized = _finalize_tool_result(
+            "손흥민 최근 경기 알려줘",
+            "web_search",
+            "검색 결과 원문 https://example.com/match",
+        )
+    finally:
+        main_module.subprocess.run = original_run
+    assert "최근 경기는" in finalized
+    assert "https://example.com/match" in finalized
 
     status = gmail_action({"action": "setup_status"})
     assert "Gmail" in status

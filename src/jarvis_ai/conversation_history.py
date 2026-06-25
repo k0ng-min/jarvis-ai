@@ -75,10 +75,24 @@ class ConversationManager:
 
         context = "\n【 최근 대화 이력 】\n"
         for conv in recent:
-            context += f"사용자: {conv['user']}\n"
-            context += f"자비스: {conv['response']}\n\n"
+            user = str(conv.get("user") or "")[:500]
+            response = str(conv.get("response") or "")[:1400]
+            context += f"사용자: {user}\n"
+            context += f"자비스: {response}\n\n"
 
         return context
+
+    def get_recent_history(self, n: int = 20) -> list[dict]:
+        """Return a copy of recent conversations for UI restoration."""
+        recent = self.conversations.get("history", [])[-n:]
+        return [
+            {
+                "user": str(item.get("user") or ""),
+                "response": str(item.get("response") or ""),
+                "source": str(item.get("source") or "voice"),
+            }
+            for item in recent
+        ]
 
     def get_stats(self) -> dict:
         """대화 통계"""

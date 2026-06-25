@@ -94,16 +94,22 @@ def run():
 
     fake_ui = FakeUI()
     original_speak_async = main_module._speak_async
+    original_monitor = main_module._monitor_tts_stop
     spoken = []
 
     async def capture_speech(text):
         spoken.append(text)
 
+    def no_stop_monitor(stop_event):
+        return None
+
     main_module._speak_async = capture_speech
+    main_module._monitor_tts_stop = no_stop_monitor
     try:
         main_module.speak_text("채팅 즉시 응답", fake_ui)
     finally:
         main_module._speak_async = original_speak_async
+        main_module._monitor_tts_stop = original_monitor
     assert fake_ui.logs == ["자비스: 채팅 즉시 응답"]
     assert spoken == ["채팅 즉시 응답"]
 
@@ -117,6 +123,9 @@ def run():
         saved = manager.conversations["history"]
         assert [item["source"] for item in saved] == ["voice", "chat"]
         assert "채팅 질문" in manager.get_recent_context(2)
+        restored = manager.get_recent_history(2)
+        assert restored[0]["user"] == "음성 질문"
+        assert restored[1]["response"] == "채팅 답변"
     history_module.HISTORY_FILE = original_history_file
 
     print("채팅 전체 출력 및 마이크 즉시 중지 테스트 통과")

@@ -1038,6 +1038,16 @@ class JarvisUI:
             self._win._jrv_sig.emit(full_text[:220])
             self._win._chat_log_sig.emit(("jarvis", full_text))
 
+    def restore_chat_history(self, history: list[dict]):
+        """Restore persisted voice/chat conversations into the chat panel."""
+        for item in history:
+            user = str(item.get("user") or "").strip()
+            response = str(item.get("response") or "").strip()
+            if user:
+                self._win._chat_log_sig.emit(("user", user))
+            if response:
+                self._win._chat_log_sig.emit(("jarvis", response))
+
     def wait_for_api_key(self):
         while not self._win._ready: time.sleep(0.1)
 

@@ -13,6 +13,7 @@ import re
 import sys
 import io
 import math
+import os
 import traceback
 import warnings
 from array import array
@@ -233,6 +234,7 @@ _session_lock = threading.Lock()
 _claude_cache: dict[str, str] = {}
 _tts_lock = threading.Lock()
 _tts_active = threading.Event()
+_tts_stop_requested = threading.Event()
 
 # ─────────────────────────────────────────────
 # 시스템 프롬프트 로드
@@ -266,9 +268,13 @@ async def _speak_async(text: str):
         communicate = edge_tts.Communicate(text, TTS_VOICE)
         audio_data = b""
         async for chunk in communicate.stream():
+            if _tts_stop_requested.is_set():
+                return
             if chunk["type"] == "audio":
                 audio_data += chunk["data"]
 
+        if _tts_stop_requested.is_set():
+            return
         audio_io = io.BytesIO(audio_data)
         data, samplerate = sf.read(audio_io)
         sd.play(data, samplerate)
@@ -276,6 +282,58 @@ async def _speak_async(text: str):
     except Exception as e:
         if "UnicodeDecodeError" not in str(type(e).__name__):
             print(f"[TTS] ❌ 오류: {e}")
+
+
+def _is_stop_speech(text: str) -> bool:
+    compact = re.sub(r"[\s!?.,~]+", "", str(text or "").lower())
+    return compact in {
+        "자비스그만", "자비스멈춰", "자비스멈춰줘",
+        "자비스말그만", "자비스조용히해", "그만말해",
+    }
+
+
+def stop_speaking() -> bool:
+    """Stop active TTS playback and return whether speech was active."""
+    was_active = _tts_active.is_set()
+    _tts_stop_requested.set()
+    try:
+        sd.stop()
+    except Exception:
+        pass
+    if was_active:
+        print("[TTS] ⏹️ 사용자 중단 요청으로 재생을 멈췄습니다.", flush=True)
+    return was_active
+
+
+def _monitor_tts_stop(stop_monitor: threading.Event):
+    """Listen only for an explicit stop phrase while Jarvis is speaking."""
+    global MIC_INDEX
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
+    recognizer.energy_threshold = 300
+    recognizer.pause_threshold = 0.45
+    mic_kwargs = {"device_index": MIC_INDEX} if MIC_INDEX is not None else {}
+    try:
+        with sr.Microphone(**mic_kwargs) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.2)
+            while _tts_active.is_set() and not stop_monitor.is_set():
+                try:
+                    audio = recognizer.listen(
+                        source,
+                        timeout=0.8,
+                        phrase_time_limit=2.5,
+                    )
+                    heard = recognizer.recognize_google(audio, language="ko-KR")
+                    if _is_stop_speech(heard):
+                        print(f"[TTS 중단 감지] '{heard}'", flush=True)
+                        stop_speaking()
+                        return
+                except (sr.WaitTimeoutError, sr.UnknownValueError):
+                    continue
+                except sr.RequestError:
+                    return
+    except Exception as exc:
+        print(f"[TTS 중단 감시] 비활성화: {type(exc).__name__}", flush=True)
 
 
 def speak_text(
@@ -288,7 +346,16 @@ def speak_text(
         return
     # 여러 응답이 겹쳐 재생되거나, TTS 중 마이크가 자기 목소리를 듣지 않게 한다.
     with _tts_lock:
+        _tts_stop_requested.clear()
         _tts_active.set()
+        stop_monitor = threading.Event()
+        monitor_thread = threading.Thread(
+            target=_monitor_tts_stop,
+            args=(stop_monitor,),
+            daemon=True,
+            name="TTSStopMonitor",
+        )
+        monitor_thread.start()
         if ui:
             ui.set_state("SPEAKING")
             ui.write_log(f"자비스: {display_text or text}")
@@ -303,7 +370,10 @@ def speak_text(
         except Exception as e:
             print(f"[TTS] ❌ {e}")
         finally:
+            stop_monitor.set()
             _tts_active.clear()
+            monitor_thread.join(timeout=1.2)
+            _tts_stop_requested.clear()
             if ui and not ui.muted:
                 ui.set_state("LISTENING")
 
@@ -579,6 +649,107 @@ def _call_claude(
         return f"오류 발생: {str(e)[:200]}"
 
 
+def _finalize_tool_result(
+    user_text: str,
+    tool_name: str,
+    raw_result: str,
+    recent_context: str = "",
+) -> str:
+    """Turn every tool payload into a concise, verified user-facing answer."""
+    raw = str(raw_result or "").strip()
+    if not raw:
+        return "도구가 결과를 반환하지 않아 완료 여부를 확인할 수 없습니다."
+
+    prompt = f"""
+당신은 자비스의 도구 결과 최종 편집자입니다.
+
+[사용자 질문]
+{user_text}
+
+[사용한 도구]
+{tool_name}
+
+[현재 날짜]
+{datetime.now().strftime("%Y-%m-%d")}
+
+[도구가 실제로 반환한 원본 결과]
+{raw[:18000]}
+
+[최근 대화 문맥]
+{recent_context[-5000:]}
+
+[엄격한 규칙]
+1. 사용자 질문에 직접 답하는 자연스러운 한국어 최종 답변만 출력하세요.
+2. 원본에 없는 사실을 추가하거나 추측하지 마세요.
+   모델의 학습 기억으로 소속팀, 직함, 경기 결과 등을 보충하는 것도 금지합니다.
+3. 검색 결과 목록을 그대로 복사하지 말고 여러 결과를 비교해 핵심만 정리하세요.
+4. 날짜, 경기 결과, 수치, 이메일 주소, URL, 메시지 ID, 스레드 ID,
+   파일명과 오류 문구는 원본과 정확히 일치시켜야 합니다.
+5. 원본이 실패·미확인·시간 초과라면 성공했다고 표현하지 마세요.
+6. 실행 도구의 성공 증거가 있으면 무엇이 확인됐는지 짧게 밝히세요.
+7. 본문은 보통 2~6문장으로 작성하고, 출처 URL이 있으면 마지막에
+   대표 출처 2~5개만 일반 텍스트 목록으로 남기세요.
+8. Markdown 제목, 표, 중첩 링크, 편집 과정 설명은 출력하지 마세요.
+9. 원본 자료가 질문에 답하기 부족하면 부족하다고만 밝히고, 기억에 의존한
+   대체 정보나 과거 소속 정보를 덧붙이지 마세요.
+10. 틱톡·개인 블로그·나무위키·불법 중계 사이트처럼 신뢰도가 낮은 URL은
+    출처 목록에서 제외하세요. 신뢰할 출처가 없으면 출처 목록을 생략하세요.
+""".strip()
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", CLAUDE_MODEL,
+        "--effort", "low",
+        "--tools", "",
+        "--permission-mode", "dontAsk",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--prompt-suggestions", "false",
+        "--no-session-persistence",
+    ]
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    print(f"[Claude 최종 정리] {tool_name} 결과 검수 시작", flush=True)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return raw
+        data = json.loads(result.stdout.strip())
+        final = str(data.get("result") or "").strip()
+        if not final:
+            return raw
+        final = re.sub(r"(?m)^\s*#{1,6}\s*", "", final)
+        final = final.replace("**", "")
+        final = re.sub(
+            r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+            r"\1: \2",
+            final,
+        )
+        print(
+            f"[Claude 최종 정리] 완료 "
+            f"({time.monotonic() - started:.1f}초, {len(final)}자)",
+            flush=True,
+        )
+        return final.strip()
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as exc:
+        print(
+            f"[Claude 최종 정리] 실패 - 원본 결과 사용: {type(exc).__name__}",
+            flush=True,
+        )
+        return raw
+
+
 # ─────────────────────────────────────────────
 # 빠른 로컬 라우터 (Claude 호출 없음)
 # ─────────────────────────────────────────────
@@ -629,6 +800,9 @@ def _fast_route(text: str) -> tuple[str | None, dict, str | None]:
         return None, {}, "네, 정상 작동 중이며 듣고 있습니다."
     if compact in {"너누구야", "넌누구야", "이름이뭐야"}:
         return None, {}, "저는 경민님의 인공지능 비서 자비스입니다."
+    if _is_stop_speech(text):
+        stop_speaking()
+        return None, {}, "말하기를 멈췄습니다."
 
     # ── Gmail 실제 API ──
     # 메일 작업은 Claude의 말로 처리하지 않고 반드시 검증 가능한 Gmail API로 보낸다.
@@ -1158,6 +1332,18 @@ class JarvisAssistant:
         self._history: list[dict] = []
         self._interaction_busy = threading.Event()
         self._conversation_manager = ConversationManager()
+        self.ui.restore_chat_history(
+            self._conversation_manager.get_recent_history(20)
+        )
+        restored_count = len(
+            self._conversation_manager.conversations.get("history", [])
+        )
+        if restored_count:
+            print(
+                f"[대화 이력] 이전 대화 {restored_count}개 로드, "
+                "최근 20개를 채팅창에 복원",
+                flush=True,
+            )
 
     @staticmethod
     def _should_store_long_term(user_text: str) -> bool:
@@ -1246,7 +1432,13 @@ class JarvisAssistant:
                 speak_fn=lambda t: speak_text(t, self.ui)  # 동기 처리
             )
             if result:
-                self._respond(user_text, result, tool_name, source)
+                final = _finalize_tool_result(
+                    user_text,
+                    tool_name,
+                    result,
+                    self._conversation_manager.get_recent_context(12),
+                )
+                self._respond(user_text, final, tool_name, source)
             return
 
         # 호출자는 이미 작업 스레드이므로 여기서 스레드를 한 번 더 만들지 않는다.
@@ -1255,15 +1447,21 @@ class JarvisAssistant:
         response = _call_claude(
             user_text,
             self.system_prompt,
-            recent_context=self._conversation_manager.get_recent_context(6),
+            recent_context=self._conversation_manager.get_recent_context(12),
         )
 
         # 도구 호출 파싱
+        called_tool, _, _ = parse_tool_call(response)
         tool_result = _parse_and_dispatch(
             response, self.ui, speak_fn=lambda t: speak_text(t, self.ui)
         )
         if tool_result is not None:
-            final = tool_result
+            final = _finalize_tool_result(
+                user_text,
+                called_tool or "unknown_tool",
+                tool_result,
+                self._conversation_manager.get_recent_context(12),
+            )
         else:
             final = _block_unverified_success(user_text, response)
 
@@ -1300,6 +1498,10 @@ class JarvisAssistant:
 
     def submit_text_command(self, text: str):
         """채팅 입력도 음성 처리와 겹치지 않게 같은 잠금으로 실행한다."""
+        if _is_stop_speech(text):
+            if stop_speaking():
+                self.ui.write_log("자비스: 말하기를 멈췄습니다.")
+            return
         if self._interaction_busy.is_set():
             self.ui.write_log("자비스: 이전 명령을 처리하고 있어요. 잠시 후 다시 보내주세요.")
             return
