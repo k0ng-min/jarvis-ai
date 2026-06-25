@@ -398,27 +398,6 @@ class HudCanvas(QWidget):
                 p.restore()
             p.restore()
 
-        # ── 답변 중: 방사형 음성 스펙트럼 ──
-        if self.speaking:
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            bars = 40
-            inner = sph_r * 1.17
-            for i in range(bars):
-                angle = (math.tau * i / bars) - math.pi / 2
-                activity = (
-                    math.sin(self._tick * 0.18 + i * 0.72) * 0.5 + 0.5
-                )
-                activity *= 0.55 + (
-                    math.sin(self._tick * 0.07 + i * 1.31) * 0.5 + 0.5
-                ) * 0.45
-                length = 7.0 + activity * 22.0
-                x1 = cx + math.cos(angle) * inner
-                y1 = cy + math.sin(angle) * inner
-                x2 = cx + math.cos(angle) * (inner + length)
-                y2 = cy + math.sin(angle) * (inner + length)
-                p.setPen(QPen(QColor(60, 165, 255, 105 + int(activity * 145)), 2.0))
-                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-
         # 텍스트 오버레이 없음 (채팅 패널로 이동)
 
     def set_hud_user(self, text: str):
